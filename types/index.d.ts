@@ -197,16 +197,20 @@ declare module 'claude-code' {
       progress: TaskProgressRecord | null
       hidden: boolean
       frame: number
-      /** Orchestrator mode; unset means on. */
+      /** Orchestrator mode; unset means off (opt-in). */
       mode: 'on' | 'off'
-      /** True once TaskInputs has been answered for the current user prompt. */
+      /** True once TaskInputs was answered for the current user prompt (informational; nothing is gated on it). */
       inputsChecked: boolean
       plan: TaskPlanRecord | null
       runs: ExecutorRun[]
       /** Epoch ms when the last agent finished; the done art shows for 3 s after (0 = none). */
       animDoneAt: number
       animDoneCrew: { id: string; type?: string }[]
+      /** Epoch ms when an agent was first seen failed; keeps the frame clock running for the shake (0 = none). */
+      animFailAt: number
       pending: PendingRun[]
+      /** True while a plan is running: the Agents pane stays open until the task is done. */
+      agentsPaneHold: boolean
       /** True after a person closed the Agents pane; it is not auto-opened again this session. */
       agentsPaneClosed: boolean
       /** True while the Agents pane is open. */
@@ -225,8 +229,10 @@ declare module 'claude-code' {
       approachAsked: boolean
       /** True after a person closed the Cubes pane, until the next plan. */
       cubesPaneClosed: boolean
-      /** Cube ids whose details are open in the Cubes pane. */
+      /** Cube ids whose details are open in the Cubes pane (plus `_done` while the Done section is shown). */
       cubesPaneOpen: string[]
+      /** The text field open under one cube in the Cubes pane: a change request or a question. */
+      cubesPaneInput: { id: string; kind: 'change' | 'ask' } | null
       /** Counter bumped by the agent poll while an agent runs, so the Cubes pane redraws its countdown. */
       paneTick: number
     }

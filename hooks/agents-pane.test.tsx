@@ -43,7 +43,11 @@ function setup($: any, on: any) {
     await ui.unmount()
     return t
   }
-  const start = () => $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  // Budgeted runs are timed (and drawn) only in orchestrator mode, which is opt-in.
+  const start = async () => {
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await $.command.run({ command: 'tp-orchestrate', args: 'on' })
+  }
   const finish = (id: string) => $.turn.complete({ agentId: id, reason: 'answer', answer: 'x' } as any)
   return { clock, opens, closes, dispatch, texts, start, finish }
 }

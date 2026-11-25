@@ -46,7 +46,7 @@ const cubesGateRef = { plugin: 'task-progress', key: 'cubesGate' } as const
 const deferredRef = { plugin: 'task-progress', key: 'deferredPrompts' } as const
 
 async function isOrchestrateOn($: any): Promise<boolean> {
-  return ((await $.state.get(modeRef)).value ?? 'on') === 'on'
+  return ((await $.state.get(modeRef)).value ?? 'off') === 'on'
 }
 
 const c: DashCtx = { snap: null, flushTimer: undefined, poll: undefined }
@@ -78,12 +78,25 @@ function schedule($: any) {
   })
 }
 
-// Once per plan: the last cube turning done runs /context, saves it, then /clear.
+// Once per plan: the last cube turning done runs /context and saves it. It never clears the
+// conversation; the toast suggests /clear and the person decides.
 const ctx = { fired: false, pending: false }
 const CTX_DELAY_MS = 1500
+/** Saved context maps live in this many numbered slots; a new one overwrites the oldest ($.fs has no delete). */
+export const CONTEXT_SLOTS = 20
+
+/** `context-01.txt` .. `context-20.txt`: the first missing slot, else the oldest. */
+export function pickContextSlot(entries: { name: string; mtimeMs: number }[]): string {
+  const name = (i: number) => `context-${String(i).padStart(2, '0')}.txt`
+  const have = new Map(entries.filter(f => /^context-\d{2}\.txt$/.test(f.name)).map(f => [f.name, f.mtimeMs]))
+  for (let i = 1; i <= CONTEXT_SLOTS; i++) if (!have.has(name(i))) return name(i)
+  let oldest = name(1)
+  for (let i = 2; i <= CONTEXT_SLOTS; i++) if (have.get(name(i))! < have.get(oldest)!) oldest = name(i)
+  return oldest
+}
 
 /** A timer (not a hook the turn waits on) fires it, so $.command.run is not rejected; the run queues until the session is idle. */
-async function runContextThenClear($: any) {
+async function runContextMap($: any) {
   if (!ctx.pending) return
   ctx.pending = false
   try {
@@ -93,18 +106,25 @@ async function runContextThenClear($: any) {
     let file = ''
     try {
       const home = String((await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? '')
-      const path = `${home}/.claude/task-progress-context/context-${new Date(at).toISOString().replace(/:/g, '-')}.txt`
-      await $.fs.write(path, text)
+      const dir = `${home}/.claude/task-progress-context`
+      let entries: { name: string; mtimeMs: number }[] = []
+      try {
+        entries = await $.fs.list(dir)
+      } catch {
+        // no folder yet: slot 01
+      }
+      const path = `${dir}/${pickContextSlot(entries)}`
+      await $.fs.write(path, `# task-progress context map, ${new Date(at).toISOString()}\n\n${text}`)
       file = path
     } catch {
       // keep the text on the snapshot even when the file cannot be written
     }
     await mutate($, s => ({ ...s, lastContextMap: { at, text, file } }))
     await flush($)
-    await $.command.run({ command: 'clear' })
+    $.ui.toast(`Plan done.${file ? ` Context map saved to ${file}.` : ''} Run /clear when you are ready to start fresh.`)
   } catch (err) {
     try {
-      $.ui.toast(`task-progress: context map / clear failed: ${err instanceof Error ? err.message : String(err)}`)
+      $.ui.toast(`task-progress: saving the context map failed: ${err instanceof Error ? err.message : String(err)}`)
     } catch {
       // no toast available
     }
@@ -125,7 +145,7 @@ function put($: any, s: Snapshot) {
   if (!was && allCubesDone(s.cubes) && !ctx.fired) {
     ctx.fired = true
     ctx.pending = true
-    $.clock.after(CTX_DELAY_MS, () => void runContextThenClear($))
+    $.clock.after(CTX_DELAY_MS, () => void runContextMap($))
   }
   schedule($)
   syncPoll($)

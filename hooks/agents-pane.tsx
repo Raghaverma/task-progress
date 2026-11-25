@@ -41,7 +41,8 @@ export async function renderAgentsPane($: any, e: any, doneMs: number) {
         <Box key={`l${i}`}>
           {line.length === 0 ? <Text>{' '}</Text> : null}
           {line.map((sp, j) => (
-            <Text key={String(j)} color={sp.color} bold={sp.bold} dimColor={sp.dim}>
+            // The art is drawn in cells: monospace keeps it lined up in the editor and desktop (the terminal always is).
+            <Text key={String(j)} color={sp.color} bold={sp.bold} dimColor={sp.dim} mono>
               {sp.text}
             </Text>
           ))}

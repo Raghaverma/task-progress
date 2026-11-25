@@ -308,12 +308,6 @@ export function glyph(tick = 0, seed = 0): Span {
   return { text: TWINKLE[(i + TWINKLE.length) % TWINKLE.length]!, color: ORANGE, bold: true }
 }
 
-// Band header: a twinkling star, the count and elapsed time.
-export function bandHeader(tick: number, agents: { id: string; type?: string }[], now: number, firstStart: number, width: number): Line {
-  const count = agents.length
-  return clipLine([glyph(tick), { text: ` ${count} agent${count === 1 ? '' : 's'} working · ${fmtElapsed(now - firstStart)}`, color: ORANGE }], width)
-}
-
 // Done line: a green check and the crew count.
 export function doneLine(tick: number, width: number, crew?: { id: string; type?: string }[]): Line {
   const up = Math.floor(tick / 2) % 2 === 0

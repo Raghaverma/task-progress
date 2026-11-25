@@ -5,10 +5,10 @@ description: "Orchestrator protocol for the main session: check inputs, plan wit
 
 # Orchestrator protocol
 
-You (the main, strongest model) plan and review. Sonnet executors (`task-progress:executor`) do the work. Orchestrator mode is toggled with `/tp-orchestrate on|off|status`; when it is off, ignore this skill.
+You (the main, strongest model) plan and review. Sonnet executors (`task-progress:executor`) do the work. Orchestrator mode is opt-in (off by default) and toggled with `/tp-orchestrate on|off|status`; when it is off, ignore this skill.
 
-## 1. Input check (before anything else)
-For every new user prompt call `TaskInputs` first. Predict what the task will need from the user: choices, credentials, paths, scope, deadlines, anything you would otherwise guess. Pass `inputs: [{question, why}]` and `asked: false`. Empty list when nothing is needed. If the result says to ask, ask them all in ONE `AskUserQuestion`, then call `TaskInputs` again with `asked: true`. Edit, Write, Bash, PowerShell, NotebookEdit and Agent are refused until this is done. Reading and searching are allowed so you can look around first.
+## 1. Input check (when the task needs something from the user)
+Predict what the task will need from the user: choices, credentials, paths, scope, deadlines, anything you would otherwise guess. If there is anything, call `TaskInputs` with `inputs: [{question, why}]` and `asked: false`, ask them all in ONE `AskUserQuestion`, then call `TaskInputs` again with `asked: true`. Skip it when nothing is needed; no tool is refused until it is called.
 
 ## 2. Plan
 Break the task into steps. For each: a self-contained executor brief, a time budget in minutes (be realistic, add slack), and its dependencies. Call `TaskPlan` with `{task, steps:[{title, minutes}]}`; it also draws the progress bar.
@@ -43,7 +43,7 @@ Each cube is atomic: Each cube is atomic: one action (one sentence), 2-6 ordered
 
 Break every cube down to functions: each flow step is `{file, fn, does, calls?}` and names the file and function, what it does, and which function it calls next (`calls`, as `file:fn`); non-code steps use file `shell` (or `browser`, `terminal`) and the command as `fn`. A step missing file, fn or does is refused.
 
-Then STOP and wait. The user approves, changes or rejects each cube in the Cubes pane (`/tp-cubes`); each approval arrives as a prompt telling you which cube to run. Never dispatch an unapproved cube: tag every dispatch `[budget: <N>m step: <k> cubes: <ids>]`; while the gate is on (`/tp-cubes on|off|status`) an untagged or unapproved dispatch is refused. When the user asks for a change you get a prompt; call `CubeRevise` (split the cube if it is not atomic), then wait again. Cube questions arrive as `[cube question <id> ...]` prompts: answer with `CubeAnswer` only and change nothing (no CubeRevise, approval or dispatch).
+Then STOP and wait. The user approves, changes or rejects each cube in the Cubes pane (`/tp-cubes`); each approval arrives as a prompt telling you which cube to run. Never dispatch an unapproved cube: tag every dispatch `[budget: <N>m step: <k> cubes: <ids>]`; while the gate is on (`/tp-cubes on|off|status`) a dispatch that tags an unapproved cube is refused. `/tp-cubes clear` drops an abandoned board. Only the main session calls `TaskPlan`, `CubeRevise`, `CubeAnswer` and `CubeReview`; sub-agents are refused. When the user asks for a change you get a prompt; call `CubeRevise` (split the cube if it is not atomic), then wait again. Cube questions arrive as `[cube question <id> ...]` prompts: answer with `CubeAnswer` only and change nothing (no CubeRevise, approval or dispatch).
 
 ### Combined review
 A cube whose executor finished goes to `reviewing`; this no longer blocks its dependents. Once every cube is built, the plugin sends one review prompt. Follow it:

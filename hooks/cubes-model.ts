@@ -14,8 +14,6 @@ const CUBE_STATUSES: readonly CubeStatus[] = ['proposed', 'approved', 'queued', 
 const SATISFIED: readonly CubeStatus[] = ['done', 'skipped', 'reviewing']
 /** Cubes the user may approve. */
 const APPROVABLE: readonly CubeStatus[] = ['proposed', 'failed', 'rejected', 'revising']
-/** Cubes that are finished or out of the run. */
-const CLOSED: readonly CubeStatus[] = ['done', 'skipped', 'rejected', 'failed']
 
 /** What the model (or the user) gives for one cube. */
 export type CubeSpec = {
@@ -282,10 +280,6 @@ export function blockedBy(board: CubeBoard, c: Cube): Cube | null {
 export function allCubesDone(board: CubeBoard | null | undefined): boolean {
   const live = (board?.cubes ?? []).filter(c => (c.status as string) !== 'rejected' && (c.status as string) !== 'deleted')
   return live.length > 0 && live.every(c => c.status === 'done')
-}
-
-export function isBoardOpen(board: CubeBoard | null | undefined): boolean {
-  return !!board && board.cubes.some(c => !CLOSED.includes(c.status))
 }
 
 const spec = (c: Cube): CubeSpec => ({
@@ -600,10 +594,9 @@ export function gateCheck(board: CubeBoard | null | undefined, tagged: string[] 
     return null
   }
   const ids = (tagged ?? []).map(x => x.toLowerCase())
-  if (ids.length === 0) {
-    if (!isBoardOpen(board)) return null
-    return 'Approval cubes are on: tag the cubes this dispatch runs in its first line, e.g. "[budget: 6m step: 2 cubes: c3]". Only cubes the user approved may run; wait for the approval prompt.'
-  }
+  // Only a dispatch that names cubes is checked. An untagged one passes, so a stale or stuck
+  // board never blocks unrelated work (/tp-cubes clear drops the board itself).
+  if (ids.length === 0) return null
   for (const id of ids) {
     const c = board.cubes.find(x => x.id === id)
     if (!c) return `There is no cube ${id} on the board. Tag only existing, approved cubes.`
