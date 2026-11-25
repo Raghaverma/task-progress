@@ -78,9 +78,21 @@ When the last cube of a plan finishes, the plugin runs `/context` and saves the 
 
 ## Install
 
-    claude plugin marketplace add <path or repo>
-    claude plugin install task-progress@local-mods
+At the prompt of a Claude Code terminal session:
 
-`feature-dev` and `code-simplifier` come along as dependencies from `claude-plugins-official` (add that marketplace first). Session start warns with the install commands if they are missing. `pr-reviewer` is bundled.
+    /plugin install task-progress --marketplace Raghaverma/task-progress
 
-Plugin manifest: `.claude-plugin/plugin.json`. Hook module: `hooks/register.tsx`.
+Answer `y` to add the marketplace, then press Enter for the user scope. From a shell:
+
+    claude plugin install task-progress --marketplace Raghaverma/task-progress
+
+In the desktop app, where `/plugin` does not run: click + next to the prompt box, then Plugins, Add marketplace with `Raghaverma/task-progress`, then Add plugin.
+
+Orchestrator mode routes work to `feature-dev` and `code-simplifier` from `claude-plugins-official`. They are not installed with task-progress, so install them too (if `claude-plugins-official` is not among your marketplaces, add it first with `claude plugin marketplace add anthropics/claude-plugins-official`):
+
+    claude plugin install feature-dev@claude-plugins-official
+    claude plugin install code-simplifier@claude-plugins-official
+
+Session start warns with these commands while they are missing. `pr-reviewer` is bundled.
+
+Plugin manifest: `.claude-plugin/plugin.json`. Marketplace: `.claude-plugin/marketplace.json`. Hook module: `hooks/register.tsx`.
