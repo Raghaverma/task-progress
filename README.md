@@ -1,6 +1,6 @@
 # task-progress
 
-A Claude Code plugin (v1.3.1). It shows an estimated progress bar above the prompt, runs an orchestrator mode with small executors, asks you to approve the plan as cubes, routes work to feature-dev and code-simplifier agents, and has a terminal Cubes pane (agents, cubes, usage).
+A Claude Code plugin. It shows an estimated progress bar above the prompt and, when you turn it on, runs an orchestrator mode with small executors, asks you to approve the plan as cubes, routes work to feature-dev and code-simplifier agents, and has a terminal Cubes pane (agents, cubes, usage).
 
 ## Progress bar
 
@@ -9,11 +9,11 @@ A Claude Code plugin (v1.3.1). It shows an estimated progress bar above the prom
 
 ## Orchestrator mode and executors
 
-On by default; `/tp-orchestrate on | off | status` (the plugin also ships a skill called `orchestrate`, so the engine refuses a bare `/orchestrate`). When off, only the progress bar remains.
+Off by default (opt-in): `/tp-orchestrate on | off | status` (the plugin also ships a skill called `orchestrate`, so the engine refuses a bare `/orchestrate`). While it is off, only the progress bar runs: nothing is gated, timed or added to the system prompt.
 
 - The main session plans and reviews; the `task-progress:executor` agent (Sonnet) executes one step each and ends with a fixed report (status, what changed, how verified, blockers). A short protocol is added to the system prompt; the full text is the `task-progress:orchestrate` skill. `TaskPlan` registers the plan and seeds the progress bar.
 - **Time budgets.** Every Agent dispatch must start with `[budget: <N>m step: <k>]`, otherwise it is refused. Below 80% of the budget calls pass; from 80% the executor gets a one-time wrap-up notice; from 100% every tool call is refused (TaskProgress excepted) until it reports. The band shows a countdown per running executor.
-- **Input check.** `TaskInputs` records the inputs the task needs. After each new user prompt, Edit, Write, NotebookEdit, Bash, PowerShell and Agent are refused in the main session until it is called. Sub-agents are not gated.
+- **Input check.** `TaskInputs` lists what the task needs from you (choices, paths, credentials) and tells Claude to ask it in one AskUserQuestion. It is advisory: no tool is refused until it is called.
 - If another plugin bypasses prompt.compose, the rules are attached to user prompts instead.
 
 ## Approval cubes
@@ -33,33 +33,48 @@ For a multi-action task, Claude calls `TaskPlan` with `cubes` and stops. Each cu
 **What you can do:**
 
 - **Approve**: runs when its dependencies are done; otherwise it is queued and starts by itself once they finish. Cubes that become ready together go to Claude in one prompt.
-- **Approve all**, **Edit** (edits must stay atomic), **Ask for a change** (Claude answers with `CubeRevise`, possibly splitting it), **Reject**, **Delete / Add / Move** (moving is refused if it would make a cycle).
+- **Approve all** (hotkey `a` while the pane has focus), **Change…** (a request Claude answers with `CubeRevise`, possibly splitting the cube), **Reject**, **Retry** a failed cube, **Restore** a rejected one, **Mark done** (skips the review), **Delete**. Editing fields directly, adding and moving cubes exist as commands but have no controls yet.
 - **Ask** a question about a cube: it is sent as `[cube question <id> "<title>"] <text>`; Claude answers with `CubeAnswer` and the answer shows in the cube's thread. Asking never changes the cube.
 
-**Dispatch gate.** While orchestrator mode and the gate are on, an Agent dispatch must tag the cubes it runs, `[budget: 6m step: 2 cubes: c3]`. A dispatch for an unapproved, unknown or still-waiting cube is denied; an untagged dispatch is denied while the board has open work.
+**Dispatch gate.** While orchestrator mode and the gate are on, an Agent dispatch tags the cubes it runs, `[budget: 6m step: 2 cubes: c3]`. A dispatch for an unapproved, unknown or still-waiting cube is denied. An untagged dispatch is not checked against the board, so an abandoned or stuck board never blocks other work.
+
+**Main session only.** `TaskPlan`, `CubeRevise`, `CubeAnswer` and `CubeReview` refuse calls from sub-agents, so an executor cannot replace the plan or approve its own review.
 
 **Combined review.** A cube whose executor finished goes to `reviewing` and no longer blocks its dependents. When every cube is built, one review runs: code-simplifier (only if code changed), then `task-progress:pr-reviewer` and `feature-dev:code-reviewer` in parallel (tag `review: <ids>`), then one `CubeReview` with `ids`. REQUEST_CHANGES reopens only cubes whose files carry P0/P1 findings. Dependents may start while a cube is in review, so a REQUEST_CHANGES fix to an earlier cube can affect later cubes that are already built; the orchestrator should re-check those. Escape hatch: `cube.markDone`.
 
-`/tp-cubes on | off | status` turns the gate on or off for new boards and shows the counts.
+`/tp-cubes on | off | status | clear` turns the gate on or off for new boards, shows the counts, or drops the board (with its plan and the progress bar it seeded) when it is abandoned or stuck.
 
 
 ### Cubes pane
 
-`/tp-cubes` opens it; it also opens by itself when a plan is made and on resume with unfinished cubes. Docked beside the transcript from 110 columns, otherwise above the prompt. It shows:
+`/tp-cubes` opens it; it also opens by itself when a plan is made and on resume with unfinished cubes. The surface places it (docked beside the transcript when there is room). It works in the terminal and in the editor extensions:
 
-- **Agents**: running agents, time left, last tool.
-- **Cubes**: each with its summary and a Details toggle (problem, steps, code, done when, flow, review); Approve, Reject and Approve all.
-- **Usage**: 5-hour and 7-day limits and top agents.
+- **Header**: the task, a progress bar (a native one in VS Code and the desktop app) and the counts.
+- **Needs you**: cubes waiting for approval, failed cubes, and rejected cubes that hold others back, each with its actions on the row.
+- **In progress** and **Up next**: one line per cube with what its agent is doing, its countdown, or what it waits for. Select a row for its details (summary, problem, steps, code, done when, review findings, your questions and Claude's answers) and its actions.
+- **Done**: folded to a count; Show lists it.
+- **Agents** not tied to a cube, and **Usage** (5-hour and 7-day limits).
 
-## Agent animation
+VS Code draws no band above the prompt, so there the task's progress rides on the spinner line (`Working… · Fix login · 3/7 · ~2m left`).
 
-- The band animates agent rows as a little orange Claude-style block mascot (walks, blinks, hops when done), with a done line.
-- The Agents pane shows big animated art. It opens on its own when agents start (in terminals at least 144 columns wide) and closes 3 s after they finish.
-- `/tp-agents` opens or closes the pane.
+## Animation
 
-## Auto /context then /clear
+`/tp-motion extreme | calm | off` sets how much moves; the choice is kept across sessions. Extreme is the default.
 
-When the last cube of a plan finishes, the plugin runs `/context`, saves the output (in `~/.claude/task-progress-context/`), then runs `/clear`. This happens once per plan.
+- **Extreme**:
+  - **Band:** the title decodes in from noise, then shimmers, beside a live equalizer, and the step count rolls. Embers drift off the head of the bar, and a finished step throws a burst of sparks. The bar flows through an aurora with a white-hot head. Each agent row has a spinner, a shimmering name, its cube, a budget meter that turns amber as time runs low and blinks red past it, a countdown, and its current tool decoding in. A finished task gets fireworks over the bar, a rainbow bar and title, and falling confetti.
+  - **Cubes pane:** status glyphs spin (running, in review), breathe (waiting for you) or orbit (approved). A status change lights the row up, a finished cube pops, and a failed one shakes. The progress bar eases between counts, Approve all shimmers, and the finished plan gets fireworks.
+  - **Agents pane:** a two-layer parallax starfield with shooting stars, each agent's scene with a budget meter under it, and a finale of fireworks, the mascot's jump and confetti.
+- **Calm**: the original motion (the walker on the bar, the mascot scenes) and spinning status glyphs.
+- **Off**: nothing moves. The frame clock slows to once a second, so countdowns still update.
+
+Claude Code tells plugins nothing about a system "reduce motion" setting in the terminal or the editor, so use `/tp-motion calm` or `off` if motion bothers you. In VS Code, the spinner line spins with a mini bar, the pane's progress bars ease between counts, and effect rows use the editor's monospace font so they stay in place.
+
+- The Agents pane opens on its own when agents start (in terminals at least 144 columns wide) and closes 3 s after they finish. `/tp-agents` opens or closes it.
+
+## Context map when a plan finishes
+
+When the last cube of a plan finishes, the plugin runs `/context` and saves the output in `~/.claude/task-progress-context/` (20 numbered files, the oldest overwritten first). It never clears the conversation: a toast suggests `/clear` and you decide. This happens once per plan.
 
 ## Install
 

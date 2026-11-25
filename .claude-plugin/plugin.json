@@ -1,9 +1,9 @@
 {
   "name": "task-progress",
-  "version": "1.9.1",
+  "version": "1.11.0",
   "author": {
     "name": "nimis"
   },
-  "description": "Estimated progress bar above the prompt, orchestrator mode that routes work to executors, feature-dev and code-simplifier agents, approval cubes (atomic plans you approve before they run, with one combined pr-reviewer review) and a terminal Cubes pane (agents, cubes, usage)",
+  "description": "Estimated progress bar above the prompt, plus an opt-in orchestrator mode that routes work to executors, feature-dev and code-simplifier agents, approval cubes (atomic plans you approve before they run, with one combined pr-reviewer review) and a terminal Cubes pane (agents, cubes, usage)",
   "types": "./types/index.d.ts"
 }

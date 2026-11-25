@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { forgetToolClock, toolSinceOf, ARRIVE_MS, FAIL_MS, SCENE_KEYS, SLEEPY_AFTER_MS, SLOT_W, bandHeader, doneLine, fmtElapsed, glyph, paneFrame, pickScene, sceneForTool, sceneFrame, sceneFrameCount, sceneRows, starfield, verbFor, type AnimAgent, type Line, type SceneKey } from './anim-frames'
+import { forgetToolClock, toolSinceOf, ARRIVE_MS, FAIL_MS, SCENE_KEYS, SLEEPY_AFTER_MS, SLOT_W, doneLine, fmtElapsed, glyph, paneFrame, pickScene, sceneForTool, sceneFrame, sceneFrameCount, sceneRows, starfield, verbFor, type AnimAgent, type Line, type SceneKey } from './anim-frames'
 
 const len = (l: Line) => l.reduce((n, s) => n + s.text.length, 0)
 const mk = (n: number): AnimAgent[] =>
@@ -15,7 +15,6 @@ test('every line stays within width', () => {
   for (const n of [0, 1, 3]) for (const width of [40, 100]) for (let tick = 0; tick < 200; tick += 3) {
     const now = 90_000 + tick * 120
     expect(len([glyph(tick, n)])).toBe(1)
-    expect(len(bandHeader(tick, mk(n), now, 1000, width))).toBeLessThanOrEqual(width)
     expect(len(doneLine(tick, width))).toBeLessThanOrEqual(width)
     expect(len(doneLine(tick, width, mk(3)))).toBeLessThanOrEqual(width)
     for (const fin of [null, now - 100]) for (const l of paneFrame(tick, mk(n), now, width, fin)) expect(len(l)).toBeLessThanOrEqual(width)
@@ -54,8 +53,6 @@ test('different types keep their names but share the one orange mascot', () => {
   expect(txt(f[5]!)).toContain('Scout')
   expect(txt(f[8]!)).toContain('Reviewer')
   expect(f.slice(1).filter(l => l.length > 1).every(l => l[0]!.color === '#D97757')).toBe(true)
-  const h = bandHeader(0, ag, 5000, 0, 60)
-  expect(txt(h)).toContain('3 agents working')
 })
 
 test('done line is a green check and the crew count, no mascot', () => {
@@ -202,7 +199,7 @@ test('band frames never contain a mascot char', () => {
   for (let tick = 0; tick < 120; tick++) {
     const strs: string[] = []
     for (const m of ['working', 'thinking', 'waiting', 'over', 'done'] as Mood[]) strs.push(walker(tick, m).map(x => x.text).join(''), trail(tick, 8).map(x => x.text).join(''))
-    strs.push(glyph(tick, tick).text, txt(bandHeader(tick, mk(3), 90_000, 0, 80)), txt(doneLine(tick, 80, mk(3))), txt(doneLine(tick, 80)))
+    strs.push(glyph(tick, tick).text, txt(doneLine(tick, 80, mk(3))), txt(doneLine(tick, 80)))
     for (const s of strs) expect(bad.test(s)).toBe(false)
   }
 })

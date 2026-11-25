@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { flushDeferredPrompts } from './dashboard'
+import { CONTEXT_SLOTS, flushDeferredPrompts, pickContextSlot } from './dashboard'
 import type { Snapshot } from '../types/index'
 import {
   PER_TURN_MAX,
@@ -218,4 +218,15 @@ test('flushDeferredPrompts restores the prompts when submit fails, and clears th
   await flushDeferredPrompts($)
   expect(store.deferredPrompts).toEqual([])
   expect(sent).toEqual(['a\nb'])
+})
+
+test('context maps rotate through 20 slots: first missing slot, then the oldest', () => {
+  expect(pickContextSlot([])).toBe('context-01.txt')
+  expect(pickContextSlot([{ name: 'context-01.txt', mtimeMs: 5 }, { name: 'other.txt', mtimeMs: 1 }])).toBe('context-02.txt')
+  // Timestamped files from older versions are left alone and do not count as slots.
+  expect(pickContextSlot([{ name: 'context-2026-11-20T10-00-00.000Z.txt', mtimeMs: 1 }])).toBe('context-01.txt')
+  const full = Array.from({ length: CONTEXT_SLOTS }, (_, i) => ({ name: `context-${String(i + 1).padStart(2, '0')}.txt`, mtimeMs: 100 + i }))
+  expect(pickContextSlot(full)).toBe('context-01.txt')
+  full[0]!.mtimeMs = 999
+  expect(pickContextSlot(full)).toBe('context-02.txt')
 })

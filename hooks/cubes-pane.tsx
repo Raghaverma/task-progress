@@ -1,67 +1,69 @@
-// The terminal side panel for approval cubes. The row builder is pure (no `$`);
-// the render and open helpers are the only parts that touch the engine.
-import type { Cube, CubeBoard } from '../types/index'
-import { buttonsFor, runPaneAction } from './cubes-pane-actions'
-import { buildAgentRows, trunc, type AgentRow } from './pane-agents'
+// The Cubes pane: the plan as a short list you act on. The model (buildPaneModel) is pure;
+// renderCubesPane draws it for the terminal and for the editor/desktop surfaces.
+import type { Cube, CubeBoard, CubeStatus, ReviewFinding, Snapshot, SnapshotAgent } from '../types/index'
+import { actionsFor, isBlocking, runPaneAction, type CubeAction, type InputKind } from './cubes-pane-actions'
+import { AURORA, along, easeOut, fireworks, flash, mix, parseMotion, pulse, rainbow, rainbowText, shimmer, spin, type Motion } from './fx'
+import type { Line } from './anim-frames'
+import { readMotion } from './motion'
+import { buildAgentRows, trunc } from './pane-agents'
 import { buildUsageRows } from './pane-usage'
-import { forgetToolClock, sceneRows, toolSinceOf, FAIL_MS, SLOT_W, MASCOT_COLOR } from './anim-frames'
 
 export const PANE_ID = 'tp-cubes'
 export const PANE_TITLE = 'Cubes'
 /** Body columns asked for while docked beside the transcript. */
 export const PANE_COLUMNS = 44
-const TITLE_MAX = 36
-/** Text columns beside the 13-col mascot slot (44 - 13 = 31). */
-const TEXT_W = PANE_COLUMNS - SLOT_W
 
-export type AgentLine = {
-  /** The 13-col slot: a mascot line, or the glyph / blanks for a one-line row. */
-  slot: string
-  mascot: boolean
-  text: string
-  /** Right-aligned-after-text time chip; counts toward the width. */
-  time?: string
-  over?: boolean
+/** One palette for both surfaces: mid-tone hues that read on light and dark backgrounds. */
+export const TONES = {
+  needs: '#D97706',
+  running: '#3B82F6',
+  review: '#8B5CF6',
+  done: '#16A34A',
+  fail: '#DC2626',
+} as const
+export type Tone = keyof typeof TONES
+
+export type SectionKey = 'needs' | 'active' | 'next' | 'done'
+const SECTION_TITLE: Record<SectionKey, string> = { needs: 'Needs you', active: 'In progress', next: 'Up next', done: 'Done' }
+
+export type DetailSection = { title: string; items: { text: string; tone?: Tone; dim?: boolean }[]; numbered?: boolean }
+
+export type PaneRow = {
+  id: string
+  status: CubeStatus
+  title: string
+  glyph: string
+  tone?: Tone
   dim?: boolean
+  /** Right-hand chip: minutes, a countdown, or a state word. */
+  meta?: string
+  metaTone?: Tone
+  /** The dim line under the title: what it waits on, who works on it, or its summary. */
+  sub?: string
+  subTone?: Tone
+  actions: CubeAction[]
+  /** Actions show on the row itself (needs-you rows) or only once it is opened. */
+  showActions: boolean
+  open: boolean
+  input?: InputKind
+  details: DetailSection[]
 }
 
-/** One Agents-section entry as lines. Animating agents (live, or done inside the done window) are 3 lines:
- *  mascot slot + text (line 1 empty, line 2 name · tag, line 3 tool · time). Others are one line plus a detail line,
- *  with text aligned to the mascot rows' text column. Every line fits PANE_COLUMNS. */
-export function buildAgentBlock(a: AgentRow, anim: 'run' | 'done' | 'fail' | null, frame: number, i: number, t: { now?: number; doneAt?: number } = {}): AgentLine[] {
-  const nameTag = (n: number) => {
-    const tag = a.tag ? ` · ${a.tag}` : ''
-    const room = Math.max(1, n - tag.length)
-    return trunc(a.name, room) + tag
-  }
-  const clip = (t: string) => trunc(t, TEXT_W)
-  if (anim) {
-    const now = t.now ?? 0
-    const slots = sceneRows({
-      tick: frame,
-      seed: i * 3,
-      now,
-      tool: a.tool,
-      startedAt: t.now !== undefined ? a.startedAt : undefined,
-      toolSince: t.now !== undefined && a.startedAt !== undefined && anim === 'run' ? toolSinceOf(a.id, a.tool, now, a.startedAt) : undefined,
-      doneAt: anim === 'done' ? (t.doneAt ?? now) : undefined,
-      failedAt: anim === 'fail' ? (a.endedAt ?? now) : undefined,
-    })
-    const timeChip = a.time ? ` · ${a.time}` : ''
-    return [
-      { slot: slots[0]!, mascot: true, text: '' },
-      { slot: slots[1]!, mascot: true, text: clip(nameTag(TEXT_W)), dim: anim === 'done' || anim === 'fail' },
-      { slot: slots[2]!, mascot: true, text: trunc(a.detail ?? '', Math.max(0, TEXT_W - timeChip.length)), time: timeChip || undefined, over: a.over, dim: true },
-    ]
-  }
-  const timeChip = a.time ? ` · ${a.time}` : ''
-  const out: AgentLine[] = [
-    { slot: a.glyph.padEnd(SLOT_W), mascot: false, text: clip(nameTag(Math.max(1, TEXT_W - timeChip.length))), time: timeChip || undefined, over: a.over, dim: a.state !== 'running' },
-  ]
-  if (a.detail) out.push({ slot: ' '.repeat(SLOT_W), mascot: false, text: trunc(a.detail, TEXT_W), dim: true })
-  return out
-}
-const snapRef = { plugin: 'task-progress', key: 'snapshot' } as const
+export type PaneSection = { key: SectionKey; title: string; rows: PaneRow[]; collapsed: boolean; count: number }
+
+export type PaneModel =
+  | { kind: 'empty' }
+  | {
+      kind: 'board'
+      task: string
+      done: number
+      total: number
+      counts: string
+      approveAll: number
+      sections: PaneSection[]
+      /** Running agents that no running cube row already shows (reviews, untagged steps). */
+      agents: { id: string; name: string; tag?: string; time?: string; over?: boolean; detail?: string }[]
+    }
 
 const FINISHED = ['done', 'skipped', 'rejected']
 
@@ -70,203 +72,477 @@ export function hasUnfinished(board: CubeBoard | null | undefined): boolean {
   return !!board && board.cubes.some(c => !FINISHED.includes(c.status))
 }
 
-export type CubeRow = {
-  kind: 'header' | 'cube' | 'empty' | 'footer'
-  /** header / empty / footer text. */
-  text?: string
-  id?: string
-  title?: string
-  glyph?: string
-  /** Status word, e.g. `waiting for approval` or `approved · starts after c1`. */
-  word?: string
-  minutes?: number
-  after?: string[]
-  color?: 'green' | 'yellow' | 'red'
-  dim?: boolean
-  /** Buttons under a cube row, from buttonsFor (the one rule). Empty for every status but `proposed`. */
-  buttons?: Array<'approve' | 'reject'>
-  /** Trimmed summary (legacy `details` when no summary). */
-  summary?: string
-  /** Details are open: sections hold the content. */
-  open?: boolean
-  /** True when the cube has any section content to open. */
-  hasDetails?: boolean
-  sections?: Array<{ title: string; items: string[]; numbered?: boolean }>
-  /** footer: how many cubes Approve all would approve. */
-  count?: number
+function sectionOf(c: Cube, board: CubeBoard): SectionKey {
+  if (c.status === 'proposed' || c.status === 'failed' || isBlocking(board, c)) return 'needs'
+  if (c.status === 'running' || c.status === 'reviewing' || c.status === 'revising') return 'active'
+  if (c.status === 'approved' || c.status === 'queued') return 'next'
+  return 'done'
 }
 
-
-function statusOf(cb: Cube, board: CubeBoard): Pick<CubeRow, 'glyph' | 'word' | 'color' | 'dim'> {
-  const open = cb.after.filter(id => !['done', 'skipped'].includes(board.cubes.find(x => x.id === id)?.status ?? 'done'))
-  switch (cb.status) {
-    case 'done':
-      return { glyph: '✓', word: 'done', color: 'green', dim: true }
-    case 'running':
-      return { glyph: '◐', word: 'running', color: 'yellow' }
-    case 'reviewing':
-      return { glyph: '◐', word: 'in review', color: 'yellow' }
-    case 'queued':
-      return { glyph: '○', word: open.length ? `approved · starts after ${open.join(', ')}` : 'approved · starting' }
-    case 'approved':
-      return { glyph: '○', word: 'approved' }
-    case 'rejected':
-      return { glyph: '✗', word: 'rejected', color: 'red', dim: true }
-    case 'failed':
-      return { glyph: '✗', word: 'failed', color: 'red' }
-    case 'skipped':
-      return { glyph: '–', word: 'skipped', dim: true }
-    case 'revising':
-      return { glyph: '○', word: 'being revised' }
-    default:
-      return { glyph: '○', word: 'waiting for approval' }
-  }
+const clock = (ms: number) => {
+  const s = Math.floor(Math.abs(ms) / 1000)
+  return `${ms < 0 ? '+' : ''}${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 }
+const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim()
+const shortType = (t: string) => t.split(':').pop() || t || 'agent'
+const blocking = (f: ReviewFinding) => f.severity === 'P0' || f.severity === 'P1'
 
-/** The board as display rows: a counts header, one row per cube, or an empty state. */
-function sectionsOf(cb: Cube): Array<{ title: string; items: string[]; numbered?: boolean }> {
-  const out: Array<{ title: string; items: string[]; numbered?: boolean }> = []
-  if (cb.problem?.length) out.push({ title: 'Problem', items: cb.problem })
-  if (cb.steps?.length) out.push({ title: 'Steps', items: cb.steps, numbered: true })
-  if (cb.code?.length) out.push({ title: 'Code touched', items: cb.code.map(c => `${c.file} › ${c.change}`) })
-  const rv = cb.review
+function detailsOf(c: Cube, subIsSummary: boolean): DetailSection[] {
+  const out: DetailSection[] = []
+  const summary = oneLine(c.summary || c.details || '')
+  if (summary && !subIsSummary) out.push({ title: 'Summary', items: [{ text: summary }] })
+  if (c.problem?.length) out.push({ title: 'Problem', items: c.problem.map(text => ({ text })) })
+  if (c.steps?.length) out.push({ title: 'Steps', items: c.steps.map(text => ({ text })), numbered: true })
+  if (c.code?.length) out.push({ title: 'Code touched', items: c.code.map(x => ({ text: `${x.file} — ${x.change}` })) })
+  if (c.doneWhen) out.push({ title: 'Done when', items: [{ text: c.doneWhen }] })
+  const rv = c.review
   if (rv && (rv.verdict || rv.summary)) {
-    const one = (rv.summary ?? '').replace(/\s+/g, ' ').trim()
-    out.push({ title: 'Review', items: [[rv.verdict, one].filter(Boolean).join(' · ')] })
+    const tone: Tone = rv.verdict === 'APPROVE' ? 'done' : rv.verdict === 'REQUEST_CHANGES' ? 'fail' : 'needs'
+    const items: DetailSection['items'] = [{ text: [rv.verdict?.replace('_', ' ').toLowerCase(), oneLine(rv.summary ?? '')].filter(Boolean).join(' · '), tone }]
+    for (const f of rv.findings ?? []) {
+      const where = f.file ? ` ${f.file}${f.line ? `:${f.line}` : ''}` : ''
+      items.push({ text: `${f.severity}${where} · ${oneLine(f.summary)}`, ...(blocking(f) ? { tone: 'fail' as const } : { dim: true }) })
+    }
+    out.push({ title: 'Review', items })
+  }
+  if (c.thread?.length) {
+    out.push({ title: 'Questions', items: c.thread.slice(-6).map(m => ({ text: `${m.role === 'user' ? 'You' : 'Claude'}: ${oneLine(m.text)}`, dim: m.role === 'user' })) })
   }
   return out
 }
 
-export function buildCubeRows(board: CubeBoard | null | undefined, openIds: string[] = []): CubeRow[] {
-  if (!board || board.cubes.length === 0) return [{ kind: 'empty', text: 'No cubes yet. A plan with cubes shows up here for approval.' }]
-  const n = (f: (c: Cube) => boolean) => board.cubes.filter(f).length
-  const done = n(c => c.status === 'done' || c.status === 'skipped')
-  const waiting = n(c => c.status === 'proposed')
-  const running = n(c => c.status === 'running' || c.status === 'reviewing')
-  const header = [`Cubes · ${done}/${board.cubes.length} done`, running ? `${running} running` : '', waiting ? `${waiting} waiting for approval` : '']
+function rowOf(c: Cube, board: CubeBoard, section: SectionKey, agents: SnapshotAgent[], now: number, openIds: string[], input: { id: string; kind: InputKind } | null): PaneRow {
+  const open = openIds.includes(c.id)
+  const unfinishedDeps = c.after.filter(a => !['done', 'skipped'].includes(board.cubes.find(x => x.id === a)?.status ?? 'done'))
+  const rejectedDep = c.after.map(a => board.cubes.find(x => x.id === a)).find(d => d?.status === 'rejected')
+  const agent = c.agentId ? agents.find(a => a.id === c.agentId) : undefined
+  const reviewer = agents.find(a => a.status === 'running' && a.cube?.kind === 'review' && a.cube.id === c.id)
+  const summary = oneLine(c.summary || c.details || '')
+  const lastAnswer = c.thread?.length ? c.thread[c.thread.length - 1] : undefined
+  let r: Omit<PaneRow, 'id' | 'status' | 'title' | 'actions' | 'showActions' | 'open' | 'details'> & { subIsSummary?: boolean }
+  switch (c.status) {
+    case 'proposed':
+      r = rejectedDep
+        ? { glyph: '●', tone: 'needs', meta: `${c.minutes}m`, sub: `blocked: ${rejectedDep.id} was rejected (restore or delete it)`, subTone: 'fail' }
+        : { glyph: '●', tone: 'needs', meta: `${c.minutes}m`, sub: summary || undefined, subIsSummary: !!summary }
+      break
+    case 'failed': {
+      const n = (c.review?.findings ?? []).filter(blocking).length
+      r = { glyph: '✗', tone: 'fail', meta: 'failed', metaTone: 'fail', sub: c.review ? `review asked for changes${n ? ` · ${n} P0/P1` : ''}` : 'its executor did not finish' }
+      break
+    }
+    case 'rejected': {
+      const held = board.cubes.filter(x => x.after.includes(c.id) && !['done', 'skipped', 'rejected', 'failed'].includes(x.status)).map(x => x.id)
+      r = { glyph: '⊘', dim: section === 'done', meta: 'rejected', sub: held.length ? `holds back ${held.join(', ')}` : c.note ? `“${oneLine(c.note)}”` : undefined, subTone: held.length ? 'fail' : undefined }
+      break
+    }
+    case 'running': {
+      const left = agent?.budgetMin !== undefined ? (agent.startedAt + agent.budgetMin * 60000 - now) : undefined
+      const warn = left !== undefined && agent?.budgetMin !== undefined && left < agent.budgetMin * 60000 * 0.2
+      r = {
+        glyph: '◐',
+        tone: 'running',
+        meta: left !== undefined ? clock(left) : `${c.minutes}m`,
+        metaTone: left !== undefined && left < 0 ? 'fail' : warn ? 'needs' : undefined,
+        sub: agent ? `${shortType(agent.type)}${agent.lastTool ? ` · ${oneLine(agent.lastTool)}` : ''}` : 'executor starting',
+      }
+      break
+    }
+    case 'reviewing':
+      r = { glyph: '◑', tone: 'review', meta: 'review', metaTone: 'review', sub: reviewer ? `${shortType(reviewer.type)}${reviewer.lastTool ? ` · ${oneLine(reviewer.lastTool)}` : ''}` : 'built · waiting for the combined review' }
+      break
+    case 'revising':
+      r = { glyph: '◌', meta: 'revising', sub: c.note ? `you asked: ${oneLine(c.note)}` : 'Claude is revising it' }
+      break
+    case 'approved':
+      r = { glyph: '○', tone: 'running', meta: 'starting', sub: 'sent to Claude' }
+      break
+    case 'queued':
+      r = { glyph: '◌', meta: `${c.minutes}m`, sub: unfinishedDeps.length ? `after ${unfinishedDeps.join(', ')}` : 'starting' }
+      break
+    case 'skipped':
+      r = { glyph: '–', dim: true, meta: 'skipped' }
+      break
+    default: {
+      const took = c.startedAt !== undefined && c.endedAt !== undefined ? c.endedAt - c.startedAt : undefined
+      r = { glyph: '✓', tone: 'done', dim: true, meta: took !== undefined ? `${Math.max(1, Math.round(took / 60000))}m` : undefined }
+    }
+  }
+  // A question waits on Claude, or Claude answered one that is not open yet.
+  if (lastAnswer && !open && section !== 'done') {
+    r.sub = lastAnswer.role === 'user' ? 'waiting for Claude’s answer' : 'Claude answered · open to read'
+    r.subTone = lastAnswer.role === 'claude' ? 'needs' : undefined
+    r.subIsSummary = false
+  }
+  const { subIsSummary, ...rest } = r
+  return {
+    id: c.id,
+    status: c.status,
+    title: c.title,
+    ...rest,
+    actions: actionsFor(c),
+    showActions: section === 'needs' || open,
+    open,
+    ...(input?.id === c.id ? { input: input.kind } : {}),
+    details: open ? detailsOf(c, !!subIsSummary) : [],
+  }
+}
+
+/** The pane as data: header counts, cubes grouped by what they need, and stray running agents. */
+export function buildPaneModel(
+  board: CubeBoard | null | undefined,
+  agents: SnapshotAgent[] = [],
+  now = 0,
+  openIds: string[] = [],
+  input: { id: string; kind: InputKind } | null = null,
+): PaneModel {
+  if (!board || board.cubes.length === 0) return { kind: 'empty' }
+  const live = board.cubes.filter(c => c.status !== 'rejected')
+  const done = live.filter(c => c.status === 'done' || c.status === 'skipped').length
+  const groups: Record<SectionKey, Cube[]> = { needs: [], active: [], next: [], done: [] }
+  for (const c of board.cubes) groups[sectionOf(c, board)].push(c)
+  const sections: PaneSection[] = (['needs', 'active', 'next', 'done'] as const)
+    .filter(k => groups[k].length > 0)
+    .map(k => {
+      const collapsed = k === 'done' && !openIds.includes('_done')
+      return {
+        key: k,
+        title: SECTION_TITLE[k],
+        count: groups[k].length,
+        collapsed,
+        rows: collapsed ? [] : groups[k].map(c => rowOf(c, board, k, agents, now, openIds, input)),
+      }
+    })
+  const counts = [`${done} of ${live.length} done`, groups.active.length ? `${groups.active.length} in progress` : '', groups.needs.length ? `${groups.needs.length} need${groups.needs.length === 1 ? 's' : ''} you` : '']
     .filter(Boolean)
     .join(' · ')
-  const rows: CubeRow[] = [{ kind: 'header', text: header }]
-  for (const cb of board.cubes) {
-    rows.push({
-      kind: 'cube',
-      id: cb.id,
-      title: trunc(cb.title, TITLE_MAX),
-      minutes: cb.minutes,
-      after: cb.after,
-      buttons: buttonsFor(cb),
-      ...statusOf(cb, board),
-      summary: (cb.summary || cb.details || '').trim() || undefined,
-      hasDetails: sectionsOf(cb).length > 0,
-      open: openIds.includes(cb.id),
-      ...(openIds.includes(cb.id) ? { sections: sectionsOf(cb) } : {}),
-    })
+  const shownAgents = new Set(board.cubes.filter(c => c.status === 'running' && c.agentId).map(c => c.agentId!))
+  const stray = buildAgentRows(agents.filter(a => !shownAgents.has(a.id) && !board.cubes.some(c => c.status === 'reviewing' && a.cube?.kind === 'review' && a.cube.id === c.id)), now)
+    .filter(a => a.state === 'running')
+    .map(a => ({ id: a.id, name: a.name, tag: a.tag, time: a.time, over: a.over, detail: a.detail }))
+  return {
+    kind: 'board',
+    task: board.task,
+    done,
+    total: live.length,
+    counts,
+    approveAll: board.cubes.filter(c => c.status === 'proposed').length,
+    sections,
+    agents: stray,
   }
-  if (waiting > 0) rows.push({ kind: 'footer', text: `Approve all (${waiting})`, count: waiting })
-  return rows
+}
+
+/** What a row's glyph and title look like at this tick: spinning, breathing, popping or shaking by status. */
+export type GlyphFx = { glyph: string; color?: string; titleColor?: string; bold?: boolean }
+
+/** `sinceChange` is the time since this cube's status last changed (Infinity when it has not, this session). */
+export function glyphFx(r: Pick<PaneRow, 'glyph' | 'tone' | 'status' | 'id'>, motion: Motion, tick: number, sinceChange: number): GlyphFx {
+  const base: GlyphFx = { glyph: r.glyph, color: r.tone ? TONES[r.tone] : undefined }
+  if (motion === 'off') return base
+  const seed = r.id.length * 3 + r.id.charCodeAt(r.id.length - 1)
+  if (r.status === 'running') base.glyph = spin('moon', tick, seed, 2)
+  if (r.status === 'reviewing') base.glyph = spin('quarter', tick, seed, 2)
+  if (motion === 'calm') return base
+  // A status change lights the title up, fading back over 1.2 s.
+  if (sinceChange < 1200) base.titleColor = flash(base.color ?? '#9CA3AF', '#FFFFFF', sinceChange, 1200)
+  switch (r.status) {
+    case 'proposed':
+      return { ...base, glyph: spin('breathe', tick, seed, 2), color: pulse(TONES.needs, '#FDE68A', tick + seed, 14), bold: true }
+    case 'approved':
+      return { ...base, glyph: spin('orbit', tick, seed, 2) }
+    case 'queued':
+      return { ...base, color: pulse('#6B7280', '#A5B4FC', tick + seed, 20) }
+    case 'revising':
+      return { ...base, glyph: spin('arc', tick, seed, 2), color: '#A5B4FC' }
+    case 'running':
+      return { ...base, color: pulse(TONES.running, '#93C5FD', tick, 10), bold: true }
+    case 'reviewing':
+      return { ...base, color: pulse(TONES.review, '#C4B5FD', tick, 10), bold: true }
+    case 'failed':
+      // A shake (the glyph jumps a column) and a red-white flash when it fails, then a slow red throb.
+      if (sinceChange < 1500) return { ...base, glyph: Math.floor(tick) % 2 === 0 ? '✗' : '×', color: flash(TONES.fail, '#FFFFFF', sinceChange % 300, 300), bold: true }
+      return { ...base, color: pulse(TONES.fail, '#F87171', tick, 16) }
+    case 'done':
+      // A pop: a burst of stars that settles into the check, flashing white to green.
+      if (sinceChange < 1600) return { ...base, glyph: ['✺', '✦', '✧', '✦', '✓'][Math.min(4, Math.floor(sinceChange / 320))]!, color: flash(TONES.done, '#FFFFFF', sinceChange, 1600), titleColor: flash('#16A34A', '#FFFFFF', sinceChange, 1600), bold: true }
+      return base
+    default:
+      return base
+  }
+}
+
+// When each cube's status last changed, as this pane saw it (status flashes and pops read it). Bounded.
+const seen = new Map<string, { status: string; at: number }>()
+function changedAt(key: string, status: string, now: number): number {
+  const rec = seen.get(key)
+  if (!rec) {
+    if (seen.size > 500) seen.clear()
+    seen.set(key, { status, at: -Infinity }) // first sight: no flash for what was already there
+    return -Infinity
+  }
+  if (rec.status !== status) seen.set(key, { status, at: now })
+  return seen.get(key)!.at
+}
+
+// The header bar eases from the old count to the new one when a cube finishes.
+let barMemo = { task: '', from: 0, to: 0, at: 0 }
+function shownDone(task: string, done: number, now: number): number {
+  if (barMemo.task !== task) barMemo = { task, from: done, to: done, at: now }
+  if (barMemo.to !== done) {
+    const cur = barMemo.from + (barMemo.to - barMemo.from) * easeOut((now - barMemo.at) / 700)
+    barMemo = { task, from: cur, to: done, at: now }
+  }
+  return barMemo.from + (barMemo.to - barMemo.from) * easeOut((now - barMemo.at) / 700)
+}
+
+const ACTION_LABEL: Record<CubeAction, string> = {
+  approve: 'Approve',
+  reject: 'Reject',
+  retry: 'Retry',
+  restore: 'Restore',
+  markDone: 'Mark done',
+  delete: 'Delete',
+  change: 'Change…',
+  ask: 'Ask…',
+}
+const PRIMARY: readonly CubeAction[] = ['approve', 'retry']
+
+/** Lists get a dot per item; a lone line and the review's verdict line (its first) do not. */
+function bulleted(sec: DetailSection, j: number): boolean {
+  if (sec.title === 'Review') return j > 0
+  return sec.items.length > 1 || sec.title === 'Problem'
 }
 
 /** Draws the Pane from the stored snapshot. Reading state subscribes, so a board change redraws it. */
-export async function renderCubesPane($: any, e: any, doneMs = 3000) {
-  const { Box, Text, Button } = $.ui.resolve(e)
-  const { value } = await $.state.get(snapRef)
+export async function renderCubesPane($: any, e: any, _doneMs = 3000) {
+  const { Box, Text, Button, Input, Progress } = $.ui.resolve(e)
+  const isTerm = (e?.surface ?? 'terminal') === 'terminal'
+  const width = Math.max(32, Number(e?.props?.bodyColumns) || PANE_COLUMNS)
+  const { value: snap } = (await $.state.get({ plugin: 'task-progress', key: 'snapshot' })) as { value: Snapshot | null }
   const { value: openValue } = await $.state.get({ plugin: 'task-progress', key: 'cubesPaneOpen' })
+  const { value: input } = await $.state.get({ plugin: 'task-progress', key: 'cubesPaneInput' })
+  await $.state.get({ plugin: 'task-progress', key: 'paneTick' }) // subscribe: the agent poll ticks it, so countdowns move
+  const motion: Motion = await readMotion($)
+  // Reading the frame subscribes the pane to the ticker; with motion off it redraws only when something changes.
+  const tick: number = motion === 'off' ? 0 : ((await $.state.get({ plugin: 'task-progress', key: 'frame' })).value ?? 0)
+  const xt = motion === 'extreme'
   const openIds: string[] = Array.isArray(openValue) ? openValue : []
-  await $.state.get({ plugin: 'task-progress', key: 'paneTick' }) // subscribe: the poll ticks it while an agent runs
-  await $.state.get({ plugin: 'task-progress', key: 'animFailAt' }) // subscribe: clearing it redraws the failed row
-  // Mascot clock: the same frame ticker, runs and done window the band and Agents pane read (it only ticks while agents run).
-  const { value: frame = 0 } = await $.state.get({ plugin: 'task-progress', key: 'frame' })
-  const { value: runs = [] } = await $.state.get({ plugin: 'task-progress', key: 'runs' })
-  const { value: doneAt = 0 } = await $.state.get({ plugin: 'task-progress', key: 'animDoneAt' })
   const now: number = await $.clock.now()
-  const inDone = !!doneAt && now - doneAt >= 0 && now - doneAt < doneMs
-  const rows = buildCubeRows(value?.cubes, openIds)
-  const agentRows = buildAgentRows(value?.agents, now)
-  const usageRows = buildUsageRows(value, now)
-  const running = agentRows.filter(a => a.state === 'running').length
+  const m = buildPaneModel(snap?.cubes, snap?.agents ?? [], now, openIds, input ?? null)
+  const act = (a: Parameters<typeof runPaneAction>[1]) => () => void runPaneAction($, a)
+  const color = (t?: Tone) => (t ? TONES[t] : undefined)
+  // Effect rows are placed cell by cell: monospace keeps them in place in the editor (the terminal always is).
+  const spans = (l: Line, key: string) => (
+    <Text key={key} mono>
+      {l.map((x, i) => (
+        <Text key={String(i)} color={x.color} bold={x.bold} dimColor={x.dim}>
+          {x.text}
+        </Text>
+      ))}
+    </Text>
+  )
+  // Track every cube's status (hidden ones too), so a change flashes the moment it shows.
+  const task = snap?.cubes?.task ?? ''
+  const since = new Map<string, number>()
+  for (const cb of snap?.cubes?.cubes ?? []) since.set(cb.id, now - changedAt(`${task}|${cb.id}`, cb.status, now))
+
+  if (m.kind === 'empty') {
+    return (
+      <Box flexDirection="column">
+        <Text bold>{motion === 'off' ? 'No plan yet' : `${spin('orbit', tick, 0, 3)} No plan yet`}</Text>
+        <Text dimColor wrap="wrap">When Claude plans a task in cubes, they show up here for you to approve.</Text>
+        {usage()}
+      </Box>
+    )
+  }
+
+  function bar(done: number, total: number) {
+    // The fill eases to a new count instead of jumping.
+    const shown = motion === 'off' ? done : shownDone(m.kind === 'board' ? m.task : '', done, now)
+    if (!isTerm) return <Progress key="progress" label="Cubes done" value={shown} max={Math.max(1, total)} valueText={`${done} of ${total} done`} color={TONES.done} />
+    const cells = Math.max(10, width - 2)
+    const lit = total > 0 ? Math.round((shown / total) * cells) : 0
+    if (xt) {
+      const allDone = total > 0 && done >= total
+      const line: Line = Array.from({ length: cells }, (_, i) =>
+        i < lit || allDone
+          ? { text: '━', color: allDone ? rainbow(i, tick * 2) : i === lit - 1 ? pulse('#FFFFFF', '#7DD3FC', tick, 6) : along(AURORA, i * 0.12 - tick * 0.25) }
+          : { text: '━', color: (i - Math.floor(tick * 0.8)) % 29 === 0 ? '#6B7280' : '#4B5160' },
+      )
+      return spans(line, 'bar')
+    }
+    return (
+      <Text>
+        <Text color={TONES.done}>{'━'.repeat(lit)}</Text>
+        <Text dimColor>{'━'.repeat(cells - lit)}</Text>
+      </Text>
+    )
+  }
+
+  function usage() {
+    const u = snap?.usage
+    if (!u || (!u.fiveHour && !u.weekly)) return null
+    const tone = (p: number) => (p >= 90 ? TONES.fail : p >= 70 ? TONES.needs : undefined)
+    if (!isTerm) {
+      return (
+        <Box flexDirection="column" marginTop={1}>
+          <Text bold dimColor>Usage</Text>
+          {u.fiveHour ? <Progress key="u5" label="5-hour limit" value={u.fiveHour.percent} max={100} valueText={`${Math.round(u.fiveHour.percent)}% of 5-hour limit`} color={tone(u.fiveHour.percent)} /> : null}
+          {u.weekly ? <Progress key="u7" label="Weekly limit" value={u.weekly.percent} max={100} valueText={`${Math.round(u.weekly.percent)}% of weekly limit`} color={tone(u.weekly.percent)} /> : null}
+        </Box>
+      )
+    }
+    const rows = buildUsageRows(snap, now).filter(r => r.kind === 'limit')
+    return (
+      <Box flexDirection="column" marginTop={1}>
+        {rows.map((r, i) => (
+          <Text key={`u${i}`} color={r.color === 'red' ? TONES.fail : r.color === 'yellow' ? TONES.needs : undefined} dimColor={!r.color}>
+            {r.text}
+          </Text>
+        ))}
+      </Box>
+    )
+  }
+
+  function row(r: PaneRow) {
+    const meta = r.meta ?? ''
+    const room = Math.max(8, width - 2 - r.id.length - 2 - (meta ? meta.length + 1 : 0))
+    const g = glyphFx(r, motion, tick, since.get(r.id) ?? Infinity)
+    // A countdown running low throbs; one past its budget blinks.
+    const metaColor = xt && r.status === 'running' && r.metaTone ? (r.metaTone === 'fail' ? (Math.floor(tick / 3) % 2 === 0 ? TONES.fail : '#7F1D1D') : pulse(TONES.needs, '#FDE68A', tick, 6)) : color(r.metaTone)
+    return (
+      <Box key={`cube-${r.id}`} flexDirection="column" marginBottom={r.open ? 1 : 0}>
+        <Box justifyContent="space-between">
+          <Button key={`row-${r.id}`} plain onPress={act({ kind: 'toggleDetails', id: r.id })}>
+            <Text color={g.color} bold={g.bold} dimColor={r.dim && !g.color}>{g.glyph}</Text>
+            {' '}
+            <Text dimColor>{r.id}</Text>
+            {'  '}
+            <Text color={g.titleColor} dimColor={r.dim && !g.titleColor} bold={r.open}>{trunc(r.title, room)}</Text>
+          </Button>
+          {meta ? <Text color={metaColor} dimColor={!metaColor}>{meta}</Text> : null}
+        </Box>
+        {r.sub ? (
+          <Box marginLeft={2}>
+            <Text color={color(r.subTone)} dimColor={!r.subTone} wrap="wrap" maxLines={2}>
+              {r.sub}
+            </Text>
+          </Box>
+        ) : null}
+        {r.open
+          ? r.details.map((sec, k) => (
+              // One blank line opens the details; the bold titles separate the sections after it.
+              <Box key={`${r.id}-${sec.title}`} flexDirection="column" marginLeft={2} marginTop={k === 0 ? 1 : 0}>
+                <Text bold dimColor>{sec.title}</Text>
+                {sec.items.map((it, j) => (
+                  <Text key={`${sec.title}-${j}`} color={color(it.tone)} dimColor={it.dim} wrap="wrap">
+                    {sec.numbered ? `${j + 1}. ${it.text}` : bulleted(sec, j) ? `· ${it.text}` : it.text}
+                  </Text>
+                ))}
+              </Box>
+            ))
+          : null}
+        {r.input ? (
+          <Box key={`in-${r.id}`} flexDirection="column" marginLeft={2} marginTop={1}>
+            <Input
+              key={`input-${r.id}`}
+              label={r.input === 'change' ? 'Change: ' : 'Ask: '}
+              placeholder={r.input === 'change' ? 'What should change?' : 'Your question about this cube'}
+              submitLabel="send"
+              autoFocus
+              onSubmit={(text: string) => void runPaneAction($, { kind: 'submitInput', id: r.id, input: r.input!, text })}
+            />
+            <Button key={`cancel-${r.id}`} plain dimColor onPress={act({ kind: 'cancelInput' })}>
+              Cancel
+            </Button>
+          </Box>
+        ) : r.showActions && r.actions.length > 0 ? (
+          <Box marginLeft={2} marginTop={r.open ? 1 : 0} flexWrap="wrap">
+            {r.actions.map(a => (
+              <Box key={`${a}-${r.id}-box`} marginRight={1}>
+                <Button
+                  key={`${a}-${r.id}`}
+                  variant={PRIMARY.includes(a) ? 'primary' : undefined}
+                  dimColor={a === 'delete' || a === 'markDone' ? true : undefined}
+                  onPress={a === 'change' || a === 'ask' ? act({ kind: 'openInput', id: r.id, input: a }) : act({ kind: a, id: r.id })}
+                >
+                  {ACTION_LABEL[a]}
+                </Button>
+              </Box>
+            ))}
+          </Box>
+        ) : null}
+      </Box>
+    )
+  }
+
+  // Everything done a moment ago: fireworks over the header for six seconds.
+  const lastEnd = Math.max(0, ...(snap?.cubes?.cubes ?? []).map(cb => cb.endedAt ?? 0))
+  const party = xt && m.total > 0 && m.done >= m.total && lastEnd > 0 && now - lastEnd >= 0 && now - lastEnd < 6000
+  const doneSince = now - changedAt(`${task}|_doneCount`, String(m.done), now)
+
+  function sectionTitle(sec: PaneSection) {
+    const text = `${sec.title} · ${sec.count}`
+    if (xt && sec.key === 'needs') return <Text bold color={pulse(TONES.needs, '#FDE68A', tick, 14)}>{text}</Text>
+    // The Done header pops when a cube lands in it.
+    if (xt && sec.key === 'done' && doneSince < 1600) {
+      return <Text bold color={flash(TONES.done, '#FFFFFF', doneSince, 1600)}>{`${['✺', '✦', '✧', '✓'][Math.min(3, Math.floor(doneSince / 400))]} ${text}`}</Text>
+    }
+    return <Text bold dimColor>{text}</Text>
+  }
+
   return (
     <Box flexDirection="column">
-      {agentRows.length > 0 ? (
-        <Box flexDirection="column" marginBottom={1}>
-          <Text bold>{`Agents · ${running} running`}</Text>
-          {agentRows.map((a, i) => {
-            const live = a.state === 'running' && Array.isArray(runs) && runs.some((r: any) => r.id === a.id)
-            if (a.state !== 'running') forgetToolClock(a.id)
-            const hop = a.state === 'done' && inDone && a.endedAt !== undefined && now - a.endedAt >= 0 && now - a.endedAt < doneMs
-            const fail = a.state === 'failed' && a.endedAt !== undefined && now - a.endedAt >= 0 && now - a.endedAt < FAIL_MS
-            return (
-              <Box key={`ag${i}`} flexDirection="column">
-                {buildAgentBlock(a, live ? 'run' : hop ? 'done' : fail ? 'fail' : null, frame, i, { now, doneAt }).map((l, j) => (
-                  <Box key={`al${j}`}>
-                    {l.mascot ? (
-                      <Text color={MASCOT_COLOR} bold>{l.slot}</Text>
-                    ) : (
-                      <Text color={a.state === 'failed' || a.over ? 'red' : a.state === 'running' ? 'yellow' : 'green'} dimColor={a.state !== 'running'}>{l.slot}</Text>
-                    )}
-                    <Text dimColor={l.dim}>{l.text}</Text>
-                    {l.time ? <Text color={l.over ? 'red' : undefined}>{l.time}</Text> : null}
-                  </Box>
-                ))}
-              </Box>
-            )
-          })}
-        </Box>
-      ) : null}
-      {rows.map((r, i) => {
-        if (r.kind === 'header') return <Text key={`h${i}`} bold>{r.text}</Text>
-        if (r.kind === 'empty') return <Text key={`e${i}`} dimColor>{r.text}</Text>
-        if (r.kind === 'footer') {
-          return (
-            <Box key={`f${i}`} marginTop={1}>
-              <Button key="approve-all" onPress={() => void runPaneAction($, { kind: 'approveAll' })}>{r.text}</Button>
-            </Box>
-          )
-        }
-        return (
-          <Box key={r.id} flexDirection="column" marginTop={i === 1 ? 1 : 0}>
-            <Box>
-              <Text color={r.color} dimColor={r.dim}>{r.glyph} </Text>
-              <Text bold={!r.dim} dimColor={r.dim}>{r.id} · {r.title}</Text>
-            </Box>
-            <Text dimColor>{`  ${r.word} · ${r.minutes}m${r.after && r.after.length ? ` · after ${r.after.join(', ')}` : ''}`}</Text>
-            {r.summary ? <Text dimColor>{`  ${r.summary}`}</Text> : null}
-            {r.hasDetails ? (
-              <Box marginLeft={2}>
-                <Button key={`details-${r.id}`} onPress={() => void runPaneAction($, { kind: 'toggleDetails', id: r.id! })}>{r.open ? '▾ Hide' : '▸ Details'}</Button>
-              </Box>
-            ) : null}
-            {r.open && r.sections
-              ? r.sections.map(sec => (
-                  <Box key={`${r.id}-${sec.title}`} flexDirection="column" marginLeft={2}>
-                    <Text bold>{sec.title}</Text>
-                    {sec.items.map((it, j) => (
-                      <Box key={j} marginLeft={2}>
-                        <Text>{sec.numbered ? `${j + 1}. ${it}` : sec.title === 'Review' ? it : `- ${it}`}</Text>
-                      </Box>
-                    ))}
-                  </Box>
-                ))
-              : null}
-            {r.buttons && r.buttons.length > 0 ? (
-              // Own line under the row: the two buttons plus the indent fit 44 columns.
-              <Box marginLeft={2}>
-                {r.buttons.map(k => (
-                  <Box key={`${k}-${r.id}`} marginRight={1}>
-                    <Button key={`${k}-${r.id}`} onPress={() => void runPaneAction($, { kind: k, id: r.id! })}>{k === 'approve' ? 'Approve' : 'Reject'}</Button>
-                  </Box>
-                ))}
-              </Box>
+      {party ? fireworks(width, 3, now - lastEnd, task.length).map((l, i) => spans(l, `fw${i}`)) : null}
+      {party ? spans(rainbowText('✦ All done ✦', tick), 'party') : null}
+      {xt ? spans(shimmer(m.task, tick, '#3B82F6', '#93C5FD', 30).map(x => ({ ...x, bold: true })), 'title') : <Text bold wrap="truncate-end">{m.task}</Text>}
+      {bar(m.done, m.total)}
+      <Text dimColor>{m.counts}</Text>
+      {m.sections.map(sec => (
+        <Box key={`sec-${sec.key}`} flexDirection="column" marginTop={1}>
+          <Box justifyContent="space-between">
+            {sectionTitle(sec)}
+            {sec.key === 'needs' && m.approveAll > 1 ? (
+              <Button key="approve-all" variant="primary" hotkey="a" onPress={act({ kind: 'approveAll' })}>
+                {xt
+                  ? shimmer(`Approve all (${m.approveAll})`, tick, '#FFFFFF', '#FDE68A', 18).map((x, i) => (
+                      <Text key={String(i)} color={x.color}>
+                        {x.text}
+                      </Text>
+                    ))
+                  : `Approve all (${m.approveAll})`}
+              </Button>
+            ) : sec.key === 'done' ? (
+              <Button key="toggle-done" plain dimColor onPress={act({ kind: 'toggleDetails', id: '_done' })}>
+                {sec.collapsed ? 'Show' : 'Hide'}
+              </Button>
             ) : null}
           </Box>
-        )
-      })}
-      {usageRows.length > 0 ? (
+          {sec.rows.map(row)}
+        </Box>
+      ))}
+      {m.agents.length > 0 ? (
         <Box flexDirection="column" marginTop={1}>
-          {usageRows.map((r, i) => (
-            <Text key={`u${i}`} bold={r.kind === 'header'} dimColor={r.color === undefined} color={r.color}>{r.kind === 'agent' ? `  ${r.text}` : r.text}</Text>
+          <Text bold dimColor>{`Agents · ${m.agents.length}`}</Text>
+          {m.agents.map(a => (
+            <Box key={`agent-${a.id}`} flexDirection="column">
+              <Box justifyContent="space-between">
+                <Text>
+                  <Text color={TONES.running}>{motion === 'off' ? '◐' : spin('moon', tick, a.id.length, 2)}</Text> {a.name}
+                  {a.tag ? <Text dimColor>{` · ${a.tag}`}</Text> : null}
+                </Text>
+                {a.time ? <Text color={a.over ? TONES.fail : undefined} dimColor={!a.over}>{a.time.replace(' left', '').replace(' over', '')}</Text> : null}
+              </Box>
+              {a.detail ? (
+                <Box marginLeft={2}>
+                  <Text dimColor wrap="truncate-end">{a.detail}</Text>
+                </Box>
+              ) : null}
+            </Box>
           ))}
         </Box>
       ) : null}
+      {usage()}
     </Box>
   )
 }

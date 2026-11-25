@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { GATED_TOOLS, answered, budgetDecision, formatCountdown, parseBudget, parseModeArg } from './register'
+import { MAIN_ONLY_TOOLS, answered, spinnerProgress, budgetDecision, formatCountdown, parseBudget, parseModeArg } from './register'
 
 const INPUTS = 'mcp__task-progress__TaskInputs'
 const PLAN = 'mcp__task-progress__TaskPlan'
@@ -23,6 +23,9 @@ function setup($: any, on: any) {
     const { Text } = $.ui.resolve(e)
     return <Text>ENGINE</Text>
   })
+  // These tests check the calm renderer; extreme motion has its own tests.
+  on('store.get', (_: any, e: any) => ({ value: e.key === 'motion' ? 'calm' : undefined }))
+  on('store.set', () => ({ value: undefined }))
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   on('tool.register', () => ({ value: { tool: 'x' } }))
   on('command.register', () => ({ value: { command: 'x' } }))
@@ -43,8 +46,13 @@ function setup($: any, on: any) {
     await ui.unmount()
     return t
   }
-  const start = () => $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  return { clock, call, dispatch, bandTexts, start }
+  const startOff = () => $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  // Orchestrator mode is opt-in; these tests opt in, as a person would with /tp-orchestrate on.
+  const start = async () => {
+    await startOff()
+    await $.command.run({ command: 'tp-orchestrate', args: 'on' })
+  }
+  return { clock, call, dispatch, bandTexts, start, startOff }
 }
 
 const run = ($: any, args?: string) => $.command.run({ command: 'orchestrate', args })
@@ -74,38 +82,15 @@ test('budget decisions: allow below 80%, warn from 80%, deny from 100%', () => {
   expect(parseModeArg('maybe')).toBeNull()
 })
 
-test('input gate: denies state-changing tools until TaskInputs, then allows', async ($, on) => {
+test('no input gate: state-changing tools pass without TaskInputs, which still says to ask listed inputs', async ($, on) => {
   const { call, start } = setup($, on)
   await start()
+  await $.prompt.submit({ text: 'do something' })
   for (const tool of ['Bash', 'Edit', 'Write', 'PowerShell', 'NotebookEdit']) {
-    expect(GATED_TOOLS).toContain(tool)
+    expect((await call(tool, { command: 'ls', file_path: '/a' })).deny).toBeUndefined()
   }
-  const denied = await call('Bash', { command: 'ls' })
-  expect(denied.deny).toContain('TaskInputs')
-  expect((await call('Edit', { file_path: '/a', old_string: 'a', new_string: 'b' })).deny).toContain('TaskInputs')
-  // Read-only and the plugin's own tools stay open.
-  expect((await call('Read', { file_path: '/a' })).deny).toBeUndefined()
-  expect((await call('Grep', { pattern: 'x' })).deny).toBeUndefined()
-  expect((await call(PROGRESS, { task: 'T', totalSteps: 2, step: 0 })).deny).toBeUndefined()
-  // Inputs that were not asked yet keep the gate shut and tell the model to ask.
   const need = await call(INPUTS, { inputs: [{ question: 'Which DB?', why: 'schema' }], asked: false })
   expect(String(need.result)).toContain('ONE AskUserQuestion')
-  expect((await call('Bash', { command: 'ls' })).deny).toBeDefined()
-  // An empty list, or inputs marked asked, opens it.
-  await call(INPUTS, { inputs: [], asked: false })
-  expect((await call('Bash', { command: 'ls' })).deny).toBeUndefined()
-})
-
-test('input gate resets on a new user prompt but not on a slash command', async ($, on) => {
-  const { call, start } = setup($, on)
-  await start()
-  await call(INPUTS, { inputs: [], asked: false })
-  expect((await call('Bash', { command: 'ls' })).deny).toBeUndefined()
-  await $.prompt.submit({ text: '/orchestrate status', command: { name: 'orchestrate' } })
-  expect((await call('Bash', { command: 'ls' })).deny).toBeUndefined()
-  await $.prompt.submit({ text: 'now do something else' })
-  expect((await call('Bash', { command: 'ls' })).deny).toContain('TaskInputs')
-  await call(INPUTS, { inputs: [{ question: 'q', why: 'w' }], asked: true })
   expect((await call('Bash', { command: 'ls' })).deny).toBeUndefined()
 })
 
@@ -248,7 +233,7 @@ test('mode off: no gate, no budget tag needed, no timing, no protocol text; on r
   let out = await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: [], tools: [], outputStyle: null, traits: [] })
   expect(out.sections.map((s: any) => s.id)).toEqual(['intro', 'task-progress:progress-bar'])
   expect((await run($, 'on')).text).toBe('Orchestrator mode on.')
-  expect((await call('Bash', { command: 'ls' })).deny).toContain('TaskInputs')
+  expect((await call('Agent', { prompt: 'no tag', description: 'd', subagent_type: 'x' })).deny).toContain('[budget:')
   out = await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: [], tools: [], outputStyle: null, traits: [] })
   expect(out.sections.map((s: any) => s.id)).toEqual(['intro', 'task-progress:orchestrator', 'task-progress:progress-bar'])
   expect(out.sections[1].text.length).toBeLessThan(1250)
@@ -263,7 +248,7 @@ test('no compose: first user prompt carries the rules, the next only a reminder'
   expect(ctx1).toContain('TaskProgress')
   const second = await $.prompt.submit({ text: 'again' })
   const ctx2 = (second.context ?? []).join(' ')
-  expect(ctx2).toContain('TaskInputs first')
+  expect(ctx2).toContain('TaskInputs if')
   expect(ctx2).not.toContain('TaskProgress')
 })
 
@@ -292,11 +277,11 @@ test('/orchestrate arguments', async ($, on) => {
   expect((await run($, 'bogus')).text).toBe('Usage: /orchestrate on | off | status')
 })
 
-test('CubeAnswer passes the input gate; state-changing tools stay gated', async ($, on) => {
+test('CubeAnswer answers from the main session; Bash is never input-gated', async ($, on) => {
   const { call, start } = setup($, on)
   await start()
   await $.prompt.submit({ text: 'a question about a cube step' })
-  expect((await call('Bash', { command: 'ls' })).deny).toContain('TaskInputs')
+  expect((await call('Bash', { command: 'ls' })).deny).toBeUndefined()
   await call('AskUserQuestion', APPROACH)
   const plan = await call(PLAN, {
     task: 'T',
@@ -309,14 +294,14 @@ test('CubeAnswer passes the input gate; state-changing tools stay gated', async 
   const bad = await call('mcp__task-progress__CubeAnswer', { id: 'zz', answer: 'x' })
   expect(bad.deny).toBeUndefined()
   expect(String(bad.result)).toContain('answer not posted')
-  expect((await call('Bash', { command: 'ls' })).deny).toContain('TaskInputs')
+  expect((await call('Bash', { command: 'ls' })).deny).toBeUndefined()
 })
 
-test('CubeReview passes the input gate, stores the review and is registered', async ($, on) => {
+test('CubeReview stores the review and is registered', async ($, on) => {
   const { call, start } = setup($, on)
   await start()
   await $.prompt.submit({ text: 'review a cube' })
-  expect((await call('Bash', { command: 'ls' })).deny).toContain('TaskInputs')
+  expect((await call('Bash', { command: 'ls' })).deny).toBeUndefined()
   await call('AskUserQuestion', APPROACH)
   await call(PLAN, { task: 'T', cubes: [{ ...DESC, id: 'c1', title: 't', action: 'Do one thing', flow: [{ file: 'a.ts', fn: 'a', does: 'a' }, { file: 'b.ts', fn: 'b', does: 'b' }], doneWhen: 'ok', minutes: 3 }] })
   const rev = await call('mcp__task-progress__CubeReview', { id: 'c1', verdict: 'REQUEST_CHANGES', summary: 'one bug', findings: [{ severity: 'P1', file: 'a.ts', line: 3, summary: 'null deref' }] })
@@ -325,7 +310,7 @@ test('CubeReview passes the input gate, stores the review and is registered', as
   const bad = await call('mcp__task-progress__CubeReview', { id: 'zz', verdict: 'APPROVE', summary: 'x' })
   expect(bad.deny).toBeUndefined()
   expect(String(bad.result)).toContain('review not stored')
-  expect((await call('Bash', { command: 'ls' })).deny).toContain('TaskInputs')
+  expect((await call('Bash', { command: 'ls' })).deny).toBeUndefined()
 })
 
 test('CubeReview with a long payload, and a failing handler, still return a result', async ($, on) => {
@@ -393,22 +378,22 @@ work`, description: 'step', subagentType: 'task-progress:executor' })
   return { ...s, calls, writes, toasts, finish, plan }
 }
 
-test('last cube done: /context then /clear once, context saved; no repeat', async ($, on) => {
-  const { clock, calls, writes, finish, plan } = ctxSetup($, on)
+test('last cube done: /context is saved once and /clear is only suggested, never run', async ($, on) => {
+  const { clock, calls, writes, toasts, finish, plan } = ctxSetup($, on)
   await plan(TWO_CUBES)
   await finish('c1', 1)
   await clock.advance(5000)
   expect(calls).toEqual([])
   await finish('c2', 2)
   await clock.advance(5000)
-  expect(calls).toEqual(['context', 'clear'])
+  expect(calls).toEqual(['context'])
   expect(writes.length).toBe(1)
-  expect(writes[0].path).toMatch(/context-.*.txt$/)
-  expect(writes[0].path).not.toMatch(/Tdd:/)
-  expect(writes[0].text).toBe('CONTEXT MAP')
+  expect(writes[0].path).toMatch(/task-progress-context\/context-01\.txt$/)
+  expect(writes[0].text).toContain('CONTEXT MAP')
+  expect(toasts.join(' ')).toContain('Run /clear when you are ready')
   await $.turn.complete({ agentId: 'a2', reason: 'answer', answer: 'again' } as any)
   await clock.advance(5000)
-  expect(calls).toEqual(['context', 'clear'])
+  expect(calls).toEqual(['context'])
 })
 
 test('a failing /context does not throw and shows a toast', async ($, on) => {
@@ -500,4 +485,175 @@ test('agent rows animate while 2 agents run, show done art for 3 s, then the ban
   const after = frames
   await clock.advance(2_000)
   expect(frames).toBe(after) // clock stopped
+})
+
+// ---- safe defaults ----
+
+test('orchestrator mode is off by default: no gates, no protocol text, only the progress bar', async ($, on) => {
+  const { call, startOff } = setup($, on)
+  on('prompt.compose', () => ({ sections: [] }))
+  await startOff()
+  expect((await run($, 'status')).text).toContain('Orchestrator mode off')
+  await $.prompt.submit({ text: 'fix the bug' })
+  expect((await call('Bash', { command: 'ls' })).deny).toBeUndefined()
+  expect((await call('Edit', { file_path: '/a', old_string: 'a', new_string: 'b' })).deny).toBeUndefined()
+  expect((await call('Agent', { prompt: 'no tag', description: 'd', subagent_type: 'Explore' })).deny).toBeUndefined()
+  const out = await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: [], tools: [], outputStyle: null, traits: [] })
+  expect(out.sections.map((x: any) => x.id)).toEqual(['task-progress:progress-bar'])
+})
+
+test('sub-agents cannot plan, revise, answer about or review cubes; the main session can', async ($, on) => {
+  const { call, start } = setup($, on)
+  await start()
+  await call('AskUserQuestion', APPROACH)
+  expect(String((await call(PLAN, { task: 'T', cubes: [ONE_CUBE] })).result)).toContain('cube plan recorded')
+  const inputs: Record<string, any> = {
+    [PLAN]: { task: 'Hijack', steps: [{ title: 's', minutes: 1 }] },
+    'mcp__task-progress__CubeRevise': { id: 'c1', title: 'changed' },
+    'mcp__task-progress__CubeAnswer': { id: 'c1', answer: 'x' },
+    'mcp__task-progress__CubeReview': { id: 'c1', verdict: 'APPROVE', summary: 'self-approved' },
+  }
+  expect(Object.keys(inputs).sort()).toEqual([...MAIN_ONLY_TOOLS].sort())
+  for (const tool of MAIN_ONLY_TOOLS) {
+    expect((await call(tool, { ...inputs[tool], agentId: 'a1' })).deny).toContain('Only the main session')
+  }
+  expect((await run($, 'status')).text).toContain('plan: T, 1 steps') // the plan was not replaced
+  expect((await call(PROGRESS, { task: 'T', totalSteps: 1, step: 0, agentId: 'a1' })).deny).toBeUndefined()
+  expect(String((await call('mcp__task-progress__CubeAnswer', { id: 'c1', answer: 'main answers' })).result)).toContain('answer posted')
+})
+
+test('a stale board never blocks untagged dispatches on later prompts', async ($, on) => {
+  const { call, start } = setup($, on)
+  await start()
+  await call('AskUserQuestion', APPROACH)
+  await call(PLAN, { task: 'T', cubes: TWO_CUBES })
+  await $.prompt.submit({ text: 'unrelated task' })
+  expect((await call('Agent', { prompt: '[budget: 3m step: 1]\nresearch', description: 'd', subagent_type: 'task-progress:executor' })).deny).toBeUndefined()
+  // A dispatch that names an unapproved cube is still refused.
+  expect((await call('Agent', { prompt: '[budget: 3m step: 1 cubes: c1]\ngo', description: 'd', subagent_type: 'task-progress:executor' })).deny).toContain('waiting for the user')
+})
+
+test('/tp-cubes clear drops the board, its plan and the bar it seeded', async ($, on) => {
+  const { call, start, bandTexts } = setup($, on)
+  await start()
+  expect((await $.command.run({ command: 'tp-cubes', args: 'clear' })).text).toBe('No cube board to clear.')
+  await call('AskUserQuestion', APPROACH)
+  await call(PLAN, { task: 'Stuck plan', cubes: TWO_CUBES })
+  expect((await bandTexts()).map(x => x.text).join('')).toContain('Stuck plan')
+  expect((await $.command.run({ command: 'tp-cubes', args: 'clear' })).text).toBe('Cube board cleared: Stuck plan (2 cubes).')
+  expect((await $.command.run({ command: 'tp-cubes', args: 'status' })).text).toContain('no cube board')
+  expect((await run($, 'status')).text).toContain('no plan')
+  expect((await bandTexts()).map(x => x.text)).toEqual(['ENGINE'])
+  expect(String((await $.command.run({ command: 'tp-cubes', args: 'bogus' })).text)).toContain('| clear')
+})
+
+// ---- UI ----
+
+test('band: one row per agent, naming its cube and its last tool; no summary row above them', async ($, on) => {
+  const { clock, call, bandTexts, start } = setup($, on)
+  await start()
+  await $.agent.spawn({ prompt: '[budget: 4m step: 3 cubes: c3]\nwork', description: 'Show budgets', subagentType: 'task-progress:executor' })
+  await call('Edit', { file_path: 'hooks/cubes-pane.tsx', old_string: 'a', new_string: 'b', agentId: 'a1' })
+  await clock.advance(300) // the snapshot write is throttled
+  const joined = (await bandTexts()).map(x => x.text).join('|')
+  expect(joined).toContain('c3 · 4:00 left')
+  expect(joined).toContain('Edit hooks/cubes-pane.tsx')
+  expect(joined).not.toContain('agents working')
+})
+
+test('spinnerProgress: task, steps and time left; nothing once done', () => {
+  const p = { task: 'Fix login', totalSteps: 4, step: 2, label: '', startedAt: 0, lastStepAt: 60_000, prevStep: 1, prevFill: 0, isDone: false, finishedAt: 0 }
+  expect(spinnerProgress(p, 60_000)).toBe('Fix login · 2/4 · ~1m left')
+  expect(spinnerProgress({ ...p, step: 0 }, 60_000)).toBe('Fix login · 0/4')
+  expect(spinnerProgress({ ...p, isDone: true }, 60_000)).toBeNull()
+  expect(spinnerProgress(null, 0)).toBeNull()
+})
+
+test('the editor, which draws no band, carries progress on the spinner line; the terminal keeps its own', async ($, on) => {
+  on('ui.render', { component: 'Spinner' }, ($: any, e: any) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>{`${e.props.word}${e.props.suffix}`}</Text>
+  })
+  mock.clock(on, { now: 5_000_000 })
+  on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
+  on('tool.register', () => ({ value: { tool: 'x' } }))
+  on('command.register', () => ({ value: { command: 'x' } }))
+  on('tool.call', () => ({ result: {} }))
+  let stored = 'off'
+  on('store.get', (_: any, e: any) => ({ value: e.key === 'motion' ? stored : undefined }))
+  on('store.set', () => ({ value: undefined }))
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+  const spinner = async (surface: string) => {
+    const ui = await $.ui.mount({ plugin: 'task-progress', component: 'Spinner', requestId: 'spin', surface, props: { word: 'Baking', message: null, suffix: '…', mode: 'tool-use' } } as any)
+    const t = (await ui.findAll({ type: 'Text' })).map((x: any) => x.text).join('')
+    await ui.unmount()
+    return t
+  }
+  expect(await spinner('vscode')).toBe('Baking…')
+  await $.tool.call({ tool: PROGRESS, task: 'Fix login', totalSteps: 4, step: 1 })
+  expect(await spinner('vscode')).toBe('Baking… · Fix login · 1/4')
+  expect(await spinner('terminal')).toBe('Baking…')
+  // With motion on, a braille spinner turns and the mini bar's next cell blinks.
+  await $.command.run({ command: 'tp-motion', args: 'extreme' })
+  const moving = await spinner('vscode')
+  expect(moving).toMatch(/^Baking… · [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Fix login ▰▰▰?▱+ 1\/4$/)
+  await $.tool.call({ tool: PROGRESS, task: 'Fix login', totalSteps: 4, step: 4, done: true })
+  expect(await spinner('vscode')).toBe('Baking…')
+  void stored
+})
+
+test('extreme is the default: the band gets an equalizer, an ember row and a flowing bar; /tp-motion changes it and keeps it', async ($, on) => {
+  const clock = mock.clock(on, { now: 5_000_000 })
+  on('ui.render', ($: any, e: any) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>ENGINE</Text>
+  })
+  const stored: Record<string, unknown> = {}
+  on('store.get', (_: any, e: any) => ({ value: stored[e.key] }))
+  on('store.set', (_: any, e: any) => {
+    stored[e.key] = e.value
+    return { value: undefined }
+  })
+  on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
+  on('tool.register', () => ({ value: { tool: 'x' } }))
+  on('command.register', () => ({ value: { command: 'x' } }))
+  on('tool.call', () => ({ result: {} }))
+  let ticks = 0
+  on('state.set', (_: any, e: any, next: any) => {
+    if (e.key === 'frame') ticks += 1
+    return next(e)
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const band = async () => {
+    const ui = await $.ui.mount({ plugin: 'task-progress', component: 'AbovePrompt', requestId: 'band', surface: 'terminal', props: { hasSurvey: false, bodyColumns: 100 } } as any)
+    const t = (await ui.findAll({ type: 'Text' })).map((x: any) => ({ text: x.text, color: x.props.color }))
+    await ui.unmount()
+    return t
+  }
+  expect(String((await $.command.run({ command: 'tp-motion' })).text)).toContain('Animation: extreme')
+  await $.tool.call({ tool: PROGRESS, task: 'Ship it', totalSteps: 4, step: 0 })
+  // A minute-long first step: the estimate (~3m) and the mood hold still while the test runs.
+  await clock.advance(60_000)
+  await $.tool.call({ tool: PROGRESS, task: 'Ship it', totalSteps: 4, step: 1 })
+  await clock.advance(900) // let the fill ease in
+  const a = await band()
+  const joined = a.map(x => x.text).join('')
+  expect(joined).toMatch(/^[▁▂▃▄▅▆▇]{5} /) // the equalizer leads the title row
+  expect(joined).toContain('━')
+  expect(new Set(a.filter(x => x.text === '━').map(x => x.color)).size).toBeGreaterThan(3) // a gradient, cell by cell
+  await clock.advance(600)
+  expect((await band()).map(x => x.text).join('')).not.toBe(joined) // it moves
+
+  expect(String((await $.command.run({ command: 'tp-motion', args: 'loud' })).text)).toContain('Usage')
+  expect(String((await $.command.run({ command: 'tp-motion', args: 'off' })).text)).toContain('Animation: off')
+  expect(stored.motion).toBe('off')
+  const before = ticks
+  await clock.advance(3000)
+  expect(ticks - before).toBeLessThanOrEqual(4) // one frame a second, for the countdowns
+  const s1 = (await band()).map(x => x.text).join('')
+  await clock.advance(2000)
+  expect((await band()).map(x => x.text).join('')).toBe(s1) // nothing moves
+
+  expect(String((await $.command.run({ command: 'tp-motion', args: 'calm' })).text)).toContain('Animation: calm')
+  expect((await band()).map(x => x.text).join('')).toContain('Ship it')
 })

@@ -56,7 +56,7 @@ test('gate and cube tag parsing', () => {
   expect(parseBudget('[budget: 6m step: 2]')).toEqual({ minutes: 6, step: 2 })
   const r: any = buildBoard('T', [ok('c1'), ok('c2', ['c1'])], true)
   expect(gateCheck(r.board, ['c1'])).toContain('waiting for the user')
-  expect(gateCheck(r.board, [])).toContain('tag')
+  expect(gateCheck(r.board, [])).toBeNull() // untagged dispatches are never blocked by a board
   expect(gateCheck(null, [])).toBeNull()
 })
 
@@ -303,10 +303,10 @@ test('CubeRevise split rewires dependents onto the last piece', () => {
   expect(reviseCube(r.board, { id: 'c9' })).toHaveProperty('error')
 })
 
-test('dispatch gate: unapproved denied, untagged denied while open, approved allowed', async () => {
+test('dispatch gate: unapproved denied, untagged allowed even while the board is open, approved allowed', async () => {
   const g = rig(pair())
   expect(gateCheck(g.board(), ['c1'])).toContain('waiting for the user')
-  expect(gateCheck(g.board(), [])).toContain('tag')
+  expect(gateCheck(g.board(), [])).toBeNull()
   expect(gateCheck(g.board(), ['c9'])).toContain('no cube c9')
   await run(g.d, 'cube.approve', { id: 'c1' })
   expect(gateCheck(g.board(), ['c1'])).toBeNull()
@@ -473,14 +473,14 @@ test('parseBudget reads review: ids', () => {
   expect(parseBudget('[budget: 6m step: 2 review: c1,c2]')).toEqual({ minutes: 6, step: 2, review: ['c1', 'c2'] })
 })
 
-test('reviewing deadlock: cubes:/untagged are denied pointing to review:, review: passes, agent finish keeps status', async () => {
+test('reviewing deadlock: cubes: is denied pointing to review:, untagged and review: pass, agent finish keeps status', async () => {
   const g = rig(pair())
   await run(g.d, 'cube.approve', { id: 'c1' })
   running(g)
   await finishAndRelease(g.d, 'a1', true)
   expect(g.st('c1')).toBe('reviewing')
   expect(gateCheck(g.board(), ['c1'])).toContain('review:')
-  expect(gateCheck(g.board(), undefined)).toContain('tag')
+  expect(gateCheck(g.board(), undefined)).toBeNull()
   expect(gateCheck(g.board(), undefined, ['c1'])).toBeNull()
   expect(gateCheck(g.board(), ['c1'], ['c1'])).toContain('not both')
   expect(gateCheck(g.board(), undefined, ['c9'])).toContain('no cube c9')

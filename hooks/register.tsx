@@ -23,8 +23,11 @@ import { installedNames, missingDeps } from './deps-check'
 import { AGENTS_PANE_ID, autoCloseAgentsPane, autoOpenAgentsPane, clearAgentsPaneHold, onAgentsPaneClose, openAgentsPaneForPlan, releaseAgentsPaneHold, renderAgentsPane, toggleAgentsPane } from './agents-pane'
 import { PANE_ID, hasUnfinished, onCubesPaneClose, openCubesPane, renderCubesPane } from './cubes-pane'
 import { buildBoard, checkDescribed, gateCheck, normalizeCube, topoOrder } from './cubes-model'
-import { FAIL_MS, bandHeader, creatureFor, doneLine, glyph, trail, verbFor, walker, type Line, type Mood } from './anim-frames'
-import type { ExecutorRun, PendingRun, TaskPlanRecord, TaskProgressRecord } from '../types/index'
+import { FAIL_MS, creatureFor, doneLine, glyph, toolSinceOf, trail, walker, type Line, type Mood } from './anim-frames'
+import { agentRow as bandAgentRow, auroraBar, doneRows, skyRows, titleRow, type BandInput } from './band-fx'
+import { readMotion } from './motion'
+import { parseMotion, spin, type Motion } from './fx'
+import type { ExecutorRun, PendingRun, SnapshotAgent, TaskPlanRecord, TaskProgressRecord } from '../types/index'
 
 const PLUGIN = 'task-progress'
 export { parseBudget }
@@ -35,8 +38,9 @@ const CUBE_TOOL = 'mcp__task-progress__CubeRevise'
 const ANSWER_TOOL = 'mcp__task-progress__CubeAnswer'
 const REVIEW_TOOL = 'mcp__task-progress__CubeReview'
 const OWN_TOOLS: readonly string[] = [TOOL, PLAN_TOOL, INPUTS_TOOL, CUBE_TOOL, ANSWER_TOOL, REVIEW_TOOL]
-/** Tools that change state; the main session may not use them before TaskInputs. */
-export const GATED_TOOLS: readonly string[] = ['Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Bash', 'PowerShell', 'Agent']
+/** The plan and cube tools answer the main session only: a sub-agent may not replace the plan or store its own review. */
+export const MAIN_ONLY_TOOLS: readonly string[] = [PLAN_TOOL, CUBE_TOOL, ANSWER_TOOL, REVIEW_TOOL]
+const SUBAGENT_DENY = 'Only the main session plans, revises, answers about or reviews cubes. Put this in your report to the orchestrator instead.'
 /** Share of the budget after which an executor is told to wrap up. */
 export const WARN_AT = 0.8
 const MAX_PARALLEL = 3
@@ -73,12 +77,12 @@ const PROMPT = [
 
 const ORCH_PROMPT = [
   'Orchestrator mode (task-progress): you plan and delegate; Sonnet executors do the work.',
-  '1) Each new user prompt: call TaskInputs first (empty inputs if none); ask any listed questions in ONE AskUserQuestion.',
+  '1) Need input from the user? List it with TaskInputs, then ask in ONE AskUserQuestion.',
   '2) Call TaskPlan (task, steps with minutes).',
   `3) Build: ${AGENT_ROLES.build}; ${AGENT_ROLES.research}/${AGENT_ROLES.design} if files unknown. Start prompt "[budget: <N>m step: <k>]". Max ${MAX_PARALLEL} at once.`,
   `Then ${AGENT_ROLES.simplify.type} (${AGENT_ROLES.simplify.model}).`,
   '4) Never edit code or build yourself; review reports, re-plan, update TaskProgress; re-dispatch unfinished work with a new budget.',
-  'Multi-action tasks: first ask the approach in ONE AskUserQuestion (header "Approach", 2-3 options + trade-offs, one Recommended; may share TaskInputs call). Then TaskPlan `cubes` (id,title,action,summary,problem[],steps[],code[{file,change}],flow 2-6 {file,fn,does,calls?} (non-code: file "shell"),after,doneWhen,minutes<=10), then STOP: user approves each cube. Never dispatch an unapproved cube; tag "cubes: <ids>". Edits: CubeRevise.',
+  'Multi-action tasks: first ask the approach in ONE AskUserQuestion (header "Approach", 2-3 options + trade-offs, one Recommended; may share the TaskInputs questions). Then TaskPlan `cubes` (id,title,action,summary,problem[],steps[],code[{file,change}],flow 2-6 {file,fn,does,calls?} (non-code: file "shell"),after,doneWhen,minutes<=10), then STOP: user approves each cube. Never dispatch an unapproved cube; tag "cubes: <ids>". Edits: CubeRevise.',
   `One review at the end: ${AGENT_ROLES.review[0]} (skill task-progress:pr-reviewer) + ${AGENT_ROLES.review[1]} (tag "review: <ids>"), CubeReview; fix P0/P1.`,
   'Protocol: skill task-progress:orchestrate. Executors ignore it.',
 ].join(' ')
@@ -279,6 +283,30 @@ export function formatMeta(p: TaskProgressRecord, now: number): string {
   return parts.join(' · ')
 }
 
+/** `~2m left`, or '' before there is anything to estimate from (a first report at step 1 would read "~1s left"). */
+function spinnerEta(p: TaskProgressRecord, now: number): string {
+  if (p.step > 0 && p.step < p.totalSteps && now - p.startedAt >= 5000) return `${formatEta(((now - p.startedAt) / p.step) * (p.totalSteps - p.step))} left`
+  return ''
+}
+
+/** The spinner-line text where no band is drawn (the editor): `Fix login bug · 3/7 · ~2m left`; null when nothing runs. */
+export function spinnerProgress(p: TaskProgressRecord | null | undefined, now: number): string | null {
+  if (!p || p.isDone) return null
+  const eta = spinnerEta(p, now)
+  return [p.task, `${p.step}/${p.totalSteps}`, ...(eta ? [eta] : [])].join(' · ')
+}
+
+/** The same with motion: a spinning braille glyph and a mini bar whose next cell blinks, `⠹ Fix login ▰▰▰▰▱▱▱▱ 2/4 · ~1m left`. */
+export function spinnerProgressAnimated(p: TaskProgressRecord | null | undefined, now: number, tick: number): string | null {
+  if (!p || p.isDone) return null
+  const cells = 8
+  const lit = Math.round((p.step / Math.max(1, p.totalSteps)) * cells)
+  const blink = Math.floor(tick / 3) % 2 === 0
+  const bar = Array.from({ length: cells }, (_, i) => (i < lit || (i === lit && blink) ? '▰' : '▱')).join('')
+  const eta = spinnerEta(p, now)
+  return `${spin('braille', tick)} ${p.task} ${bar} ${p.step}/${p.totalSteps}${eta ? ` · ${eta}` : ''}`
+}
+
 /** `Fix login bug — step 3 of 7 (43%) · running tests · 4m 10s elapsed · ~2m left` */
 export function formatReply(p: TaskProgressRecord | null | undefined, now: number): string {
   if (!p) return 'No task in progress.'
@@ -333,6 +361,17 @@ export function overlayWalker(cells: Cell[], pos: number, totalSteps: number, fr
     out[tStart + i] = { ch: s.text, color: s.dim ? C_DIM_TRAIL : (s.color ?? C_TO) }
   })
   for (let i = 0; i < room; i++) out[start + i] = wcells[i]!
+  return out
+}
+
+/** Bar cells as spans: neighbours of one colour share a span. */
+export function cellsLine(cells: Cell[]): Line {
+  const out: Line = []
+  for (const c of cells) {
+    const last = out.at(-1)
+    if (last && (last.color ?? '') === c.color) last.text += c.ch
+    else out.push(c.color ? { text: c.ch, color: c.color } : { text: c.ch })
+  }
   return out
 }
 
@@ -416,11 +455,13 @@ type Ctx = {
   composeSeen: boolean
   /** True once the rules were attached to a user prompt as a fallback. */
   rulesSent: boolean
+  /** The frame period: TICK_MS while things move, once a second with motion off (countdowns only). */
+  tickMs: number
 }
 
 function startTicker($: any, c: Ctx) {
   if (c.ticker) return
-  c.ticker = $.clock.every(TICK_MS, () => {
+  c.ticker = $.clock.every(c.tickMs, () => {
     c.frame += 1
     void $.state.set(frameRef, c.frame)
   })
@@ -447,8 +488,26 @@ async function releaseTicker($: any, c: Ctx) {
   if (!shows && !(runs && runs.length > 0) && !animating && !shaking) stopTicker(c)
 }
 
+// State keys are literal consts of the file that uses them (the engine lists what a module reads and writes).
+const motionRef = { plugin: 'task-progress', key: 'motion' } as const
+/** Sets the motion level, keeps it for later sessions and retimes a running frame clock. */
+async function setMotion($: any, c: Ctx, m: Motion) {
+  await $.state.set(motionRef, m)
+  try {
+    await $.store.set('motion', m)
+  } catch {
+    // no store here: the choice lasts this session
+  }
+  c.tickMs = m === 'off' ? 1000 : TICK_MS
+  if (c.ticker) {
+    stopTicker(c)
+    startTicker($, c)
+  }
+}
+
+/** Orchestrator mode is opt-in: unset means off. */
 async function isOn($: any): Promise<boolean> {
-  return ((await $.state.get(modeRef)).value ?? 'on') === 'on'
+  return ((await $.state.get(modeRef)).value ?? 'off') === 'on'
 }
 async function getRuns($: any): Promise<ExecutorRun[]> {
   return (await $.state.get(runsRef)).value ?? []
@@ -499,23 +558,26 @@ async function applyProgress(
 }
 
 
+/** Hides and forgets the bar now (used by /progress clear and /tp-cubes clear). */
+async function clearBar($: any, c: Ctx) {
+  c.clearTimer?.cancel()
+  c.clearTimer = undefined
+  await $.state.set(hiddenRef, true)
+  await $.state.set(progressRef, null)
+  await quiet(dashProgress($, null))
+  await releaseTicker($, c)
+}
+
 /**
- * The enforcement rules: input gate and dispatch budget for the main session, time
- * budget for sub-agents. Plugin tools and the plugin's own calls pass. `notice` is
- * the 80% wrap-up line added to an allowed call's result.
+ * The enforcement rules: dispatch rules for the main session, time budget for
+ * sub-agents. Plugin tools and the plugin's own calls pass. `notice` is the 80%
+ * wrap-up line added to an allowed call's result.
  */
 async function gateDecision($: any, e: any, isOwnCall: boolean, c: Ctx): Promise<{ deny?: string; notice?: string }> {
   if (OWN_TOOLS.includes(e.tool) || isOwnCall || !(await isOn($))) return {}
   const agentId = e.agentId as string | undefined
 
   if (!agentId) {
-    if (!GATED_TOOLS.includes(e.tool)) return {}
-    const { value: isChecked } = await $.state.get(checkedRef)
-    if (!isChecked) {
-      return {
-        deny: `Orchestrator mode: call ${INPUTS_TOOL} first for this user prompt (an empty inputs list is fine if nothing is needed), then ${e.tool}. If it lists questions, ask them in one AskUserQuestion.`,
-      }
-    }
     if (e.tool === 'Agent' && (e.subagent_type ?? e.subagentType) === AGENT_ROLES.simplify.type && e.model !== 'sonnet') {
       return { deny: 'code-simplifier runs on Sonnet: add model: "sonnet" to this Agent call.' }
     }
@@ -576,16 +638,14 @@ async function orchestrateCommand($: any, e: any) {
   const isOrch = await isOn($)
   const runs = await getRuns($)
   const { value: plan } = await $.state.get(planRef)
-  const { value: isChecked } = await $.state.get(checkedRef)
   const parts = [`Orchestrator mode ${isOrch ? 'on' : 'off'}`]
-  if (isOrch) parts.push(`input check ${isChecked ? 'done' : 'pending'} for this prompt`)
   parts.push(plan ? `plan: ${plan.task}, ${plan.steps.length} steps` : 'no plan')
   parts.push(`${runs.length} executor${runs.length === 1 ? '' : 's'} running`)
   return { text: parts.join(' · ') }
 }
 
 export const register: Register = on => {
-  const c: Ctx = { clearTimer: undefined, ticker: undefined, frame: 0, doneIds: [], composeSeen: false, rulesSent: false }
+  const c: Ctx = { clearTimer: undefined, ticker: undefined, frame: 0, doneIds: [], composeSeen: false, rulesSent: false, tickMs: TICK_MS }
   // The dashboard poll stamps a failed agent; keep the clock running for its shake, then redraw once to the failed row.
   on('state.set', ($, e, next) => {
     if (e.plugin === 'task-progress' && e.key === 'animFailAt' && e.value) {
@@ -745,6 +805,11 @@ export const register: Register = on => {
       },
     })
     try {
+      await $.command.register({ name: 'tp-motion', description: 'Animation level: /tp-motion extreme | calm | off' })
+    } catch {
+      // best effort
+    }
+    try {
       await $.command.register({ name: 'tp-agents', description: 'Toggle the animated Agents pane' })
     } catch {
       // best effort
@@ -752,7 +817,7 @@ export const register: Register = on => {
     try {
       await $.command.register({
         name: 'tp-cubes',
-        description: 'Approval cubes: /tp-cubes [panel] | on | off | status',
+        description: 'Approval cubes: /tp-cubes [panel] | on | off | status | clear',
       })
     } catch {
       // never let a command refusal keep the tools from registering
@@ -760,7 +825,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'TaskInputs',
       description:
-        'Call first for every new user prompt, before any edit, command or dispatch: list the inputs the task will need from the user (empty list if none). Set asked true once you have asked them.',
+        'Orchestrator: list the inputs the task needs from the user (choices, paths, credentials) before planning; it tells you to ask them in one AskUserQuestion. Set asked true once you have asked them.',
       isDeferred: false,
       inputSchema: {
         type: 'object',
@@ -790,6 +855,15 @@ export const register: Register = on => {
     c.crew = []
     await $.state.set(pendingRef, [])
     stopTicker(c)
+    let stored: unknown
+    try {
+      stored = await $.store.get('motion')
+    } catch {
+      // no store: the default
+    }
+    const motion = parseMotion(stored) ?? parseMotion((await $.state.get(motionRef)).value) ?? 'extreme'
+    await $.state.set(motionRef, motion)
+    c.tickMs = motion === 'off' ? 1000 : TICK_MS
     if (value && !value.isDone) startTicker($, c)
     await quiet(onSessionStart($, e))
     // Safety net: once per session, say so when the plugins the work is routed to are not installed.
@@ -826,6 +900,7 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: PLAN_TOOL }, async ($, e, next) => {
+    if (e.agentId) return { deny: SUBAGENT_DENY }
     const rawCubes: any[] = Array.isArray(e.cubes) ? e.cubes : []
     if (rawCubes.length > 0) {
       if (!(await $.state.get(approachRef)).value) return { result: `plan not recorded: ${APPROACH_DENY}` }
@@ -882,8 +957,9 @@ export const register: Register = on => {
     }
   })
 
+  // The cube tools answer the main session only (registered before the enforcement hook, so they check it here).
   on('tool.call', { tool: CUBE_TOOL }, async ($, e, next) =>
-    answered(async () => {
+    e.agentId ? { deny: SUBAGENT_DENY } : answered(async () => {
       const r = await dashReviseCube($, e)
       return r.ok
         ? `${r.message}. It is back with the user as proposed; STOP and wait for the approval prompt.`
@@ -892,14 +968,14 @@ export const register: Register = on => {
   )
 
   on('tool.call', { tool: ANSWER_TOOL }, async ($, e, next) =>
-    answered(async () => {
+    e.agentId ? { deny: SUBAGENT_DENY } : answered(async () => {
       const r = await dashAnswerCube($, e)
       return r.ok ? `${r.message}. Nothing else changed; do not act on the cube.` : `answer not posted: ${r.message}`
     }),
   )
 
   on('tool.call', { tool: REVIEW_TOOL }, async ($, e, next) =>
-    answered(async () => {
+    e.agentId ? { deny: SUBAGENT_DENY } : answered(async () => {
       const r = await dashReviewCube($, e)
       return r.ok ? `${r.message}.` : `review not stored: ${r.message}`
     }),
@@ -928,7 +1004,18 @@ export const register: Register = on => {
       const n = (st: string) => b.cubes.filter(x => x.status === st).length
       return { text: `Approval cubes ${gate} · ${b.cubes.length} cubes: ${n('proposed')} waiting, ${n('approved') + n('queued')} approved, ${n('running')} running, ${n('reviewing')} in review, ${n('done')} done` }
     }
-    return { text: 'Usage: /tp-cubes [panel] | on | off | status' }
+    if (a === 'clear') {
+      // Drops an abandoned or stuck board: its plan, and the bar it seeded, go with it.
+      const b = await dashGetCubes($)
+      if (!b) return { text: 'No cube board to clear.' }
+      await dashSetCubes($, null)
+      await $.state.set(planRef, null)
+      const { value: p } = await $.state.get(progressRef)
+      if (p && p.task === b.task && !p.isDone) await clearBar($, c)
+      await quiet(releaseAgentsPaneHold($))
+      return { text: `Cube board cleared: ${b.task} (${b.cubes.length} cube${b.cubes.length === 1 ? '' : 's'}).` }
+    }
+    return { text: 'Usage: /tp-cubes [panel] | on | off | status | clear' }
   })
 
   on('tool.call', { tool: INPUTS_TOOL }, async ($, e, next) => {
@@ -965,7 +1052,7 @@ export const register: Register = on => {
           PROMPT
         c.rulesSent = true
       } else if (orch) {
-        text = 'task-progress orchestrator on: TaskInputs first, then (for cubes) the Approach question, then TaskPlan, then executors with "[budget: <N>m step: <k>]".'
+        text = 'task-progress orchestrator on: TaskInputs if you need anything from the user, then (for cubes) the Approach question, then TaskPlan, then executors with "[budget: <N>m step: <k>]".'
       }
       if (text) return next({ ...e, context: [...(e.context ?? []), text] })
     }
@@ -1073,12 +1160,7 @@ export const register: Register = on => {
       return { text: formatReply(value, await $.clock.now()) }
     }
     if (arg === 'clear') {
-      c.clearTimer?.cancel()
-      c.clearTimer = undefined
-      await $.state.set(hiddenRef, true)
-      await $.state.set(progressRef, null)
-      await quiet(dashProgress($, null))
-      await releaseTicker($, c)
+      await clearBar($, c)
       return { text: 'Progress bar cleared.' }
     }
     return { text: 'Usage: /progress  ·  /progress clear' }
@@ -1097,9 +1179,33 @@ export const register: Register = on => {
     return next(e)
   })
   on('command.run', { command: 'tp-agents' }, async $ => ({ text: await toggleAgentsPane($) }))
+  on('command.run', { command: 'tp-motion' }, async ($, e) => {
+    const arg = String(e.args ?? '').trim()
+    if (arg === '' || arg === 'status') return { text: `Animation: ${await readMotion($)}. Choose extreme, calm or off.` }
+    const m = parseMotion(arg)
+    if (!m) return { text: 'Usage: /tp-motion extreme | calm | off' }
+    await setMotion($, c, m)
+    return { text: m === 'extreme' ? 'Animation: extreme. Everything moves.' : m === 'calm' ? 'Animation: calm. The original, lighter motion.' : 'Animation: off. Nothing moves; countdowns still update.' }
+  })
 
   on('command.run', { command: 'orchestrate' }, orchestrateCommand)
   on('command.run', { command: 'tp-orchestrate' }, orchestrateCommand)
+
+  // The editor (VS Code) raises no AbovePrompt, so the band never shows there: the task's progress
+  // rides on the spinner line instead. Other surfaces keep the engine's line as it is.
+  on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
+    if ((e as any).surface !== 'vscode') return next(e)
+    const { value: progress } = await $.state.get(progressRef)
+    const { value: isHidden } = await $.state.get(hiddenRef)
+    const motion = await readMotion($)
+    const now = await $.clock.now()
+    let text = isHidden ? null : spinnerProgress(progress, now)
+    // Reading the frame subscribes the line to the ticker, so it spins; with motion off it stays still.
+    if (text && motion !== 'off') text = spinnerProgressAnimated(progress, now, (await $.state.get(frameRef)).value ?? 0)
+    if (!text) return next(e)
+    const props: any = (e as any).props ?? {}
+    return next({ ...e, props: { ...props, suffix: `${props.suffix ?? '…'} · ${text}` } } as any)
+  })
 
   // The band: one row above the prompt. Reading state while drawing subscribes this
   // instance, so every $.state.set above redraws it.
@@ -1113,12 +1219,14 @@ export const register: Register = on => {
     if (!showsBar && runs.length === 0 && !doneNow) return next(e)
 
     const { Box, Text } = $.ui.resolve(e)
-    const { value: frame = 0 } = await $.state.get(frameRef)
+    const motion = await readMotion($)
+    // With motion off the band never reads the frame, so the ticker never redraws it.
+    const frame: number = motion === 'off' ? 0 : ((await $.state.get(frameRef)).value ?? 0)
     const now = await $.clock.now()
 
     const width: number = Math.max(20, Number((e as any).props?.bodyColumns) || 80)
     const { value: snap } = await $.state.get(snapshotRef)
-    const toolOf = (id: string): string | undefined => snap?.agents?.find((a: any) => a.id === id)?.lastTool
+    const agentOf = (id: string): SnapshotAgent | undefined => snap?.agents?.find((a: any) => a.id === id)
     const isDoneShown = runs.length === 0 && !!doneAt && now - doneAt >= 0 && now - doneAt < ANIM_DONE_MS
     const asRow = (line: Line, key: string) => (
       <Box key={key}>
@@ -1130,26 +1238,54 @@ export const register: Register = on => {
       </Box>
     )
 
+    if (motion === 'extreme') {
+      const lines: Line[] = []
+      if (progress && showsBar) {
+        const n = segmentCount(progress.totalSteps)
+        const w = segmentWidth(n)
+        const pos = barPosition(progress, now, frame)
+        const waitingOnUser = runs.length === 0 && !!(snap as any)?.cubes?.cubes?.some?.((x: any) => x.status === 'proposed')
+        const mood = bandMood(progress, { waitingOnUser }, now)
+        const meta = formatMeta(progress, now)
+        const input: BandInput = { ...progress, eta: progress.isDone ? meta : meta.split(' · ').slice(1).join(' · '), mood }
+        lines.push(titleRow(input, now, frame, width), ...skyRows(input, n, w, pos, now, frame))
+        lines.push(cellsLine(overlayWalker(auroraBar(n, w, pos, frame, progress.isDone), pos, progress.totalSteps, frame, mood)))
+      }
+      if (isDoneShown) {
+        const { value: crew = [] } = await $.state.get(doneCrewRef)
+        lines.push(...doneRows(crew.length, frame, width))
+      } else {
+        runs.forEach((r, i) => {
+          const a = agentOf(r.id)
+          const tag = a?.cube ? (a.cube.kind === 'review' ? `review ${a.cube.id}` : a.cube.id) : runLabel(r, i)
+          const what = (a?.lastTool || a?.description || '').replace(/\s+/g, ' ').trim()
+          const row = { id: r.id, name: creatureFor(r.type, r.id).name, tag, startedAt: r.startedAt, budgetMs: r.budgetMs, what, whatSince: toolSinceOf(r.id, a?.lastTool, now, r.startedAt) }
+          lines.push(bandAgentRow(row, i, now, frame, width))
+        })
+      }
+      return <Box flexDirection="column">{lines.map((l, i) => asRow(l, `x${i}`))}</Box>
+    }
+
     let agentRow: any = null
     if (isDoneShown) {
       const { value: crew = [] } = await $.state.get(doneCrewRef)
       agentRow = asRow(doneLine(frame, width, crew), 'done')
     } else if (runs.length > 0) {
-      const firstStart = Math.min(...runs.map(r => r.startedAt))
+      // One row per agent (no summary row above them): who, which cube, time left, and what it is doing now.
       agentRow = (
         <Box flexDirection="column">
-          {asRow(bandHeader(frame, runs.map(r => ({ id: r.id, type: r.type })), now, firstStart, width), 'head')}
           {runs.map((r, i) => {
             const left = r.startedAt + r.budgetMs - now
             const color = left < 0 ? C_OVER : left < r.budgetMs * (1 - WARN_AT) ? C_WARN : undefined
             const cr = creatureFor(r.type, r.id)
             const g = glyph(frame, i * 3)
-            const tool = toolOf(r.id)
-            const main = cr.name + ' · ' + runLabel(r, i) + ' · ' + formatCountdown(left)
-            // Whatever room the glyph and the countdown leave goes to the verb or tool; the label stays whole.
+            const a = agentOf(r.id)
+            const tag = a?.cube ? (a.cube.kind === 'review' ? `review ${a.cube.id}` : a.cube.id) : runLabel(r, i)
+            const main = cr.name + ' · ' + tag + ' · ' + formatCountdown(left)
+            // Whatever room the glyph and the countdown leave goes to the last tool (else the brief); the label stays whole.
             const room = Math.max(0, width - 2 - (g.text.length + 1) - main.length - 3)
-            const what = tool ? '· ' + tool : verbFor(r.id, now)
-            const extra = room > 3 ? (what.length > room ? what.slice(0, room - 1) + '…' : what) : ''
+            const what = (a?.lastTool || a?.description || '').replace(/\s+/g, ' ').trim()
+            const extra = room > 3 && what ? (what.length > room ? what.slice(0, room - 1) + '…' : what) : ''
             return (
               <Box key={r.id}>
                 <Text color={g.color} bold={g.bold} dimColor={g.dim}>{g.text + ' '}</Text>

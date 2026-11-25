@@ -18,6 +18,9 @@ function setup($: any, on: any) {
     const { Text } = $.ui.resolve(e)
     return <Text>ENGINE</Text>
   })
+  // These tests check the calm renderer; extreme motion has its own tests.
+  on('store.get', (_: any, e: any) => ({ value: e.key === 'motion' ? 'calm' : undefined }))
+  on('store.set', () => ({ value: undefined }))
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   on('tool.register', () => ({ value: { tool: 'x' } }))
   on('command.register', () => ({ value: { command: 'x' } }))
@@ -43,7 +46,11 @@ function setup($: any, on: any) {
     await ui.unmount()
     return t
   }
-  const start = () => $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  // Budgeted runs are timed (and drawn) only in orchestrator mode, which is opt-in.
+  const start = async () => {
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    await $.command.run({ command: 'tp-orchestrate', args: 'on' })
+  }
   const finish = (id: string) => $.turn.complete({ agentId: id, reason: 'answer', answer: 'x' } as any)
   return { clock, opens, closes, dispatch, texts, start, finish }
 }
