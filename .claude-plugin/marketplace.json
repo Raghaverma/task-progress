@@ -1,0 +1,13 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "task-progress",
+  "description": "The task-progress Claude Code plugin, installable straight from this repository",
+  "owner": { "name": "Raghaverma" },
+  "plugins": [
+    {
+      "name": "task-progress",
+      "description": "Estimated progress bar above the prompt, plus an opt-in orchestrator mode with approval cubes and a Cubes pane",
+      "source": "./"
+    }
+  ]
+}
