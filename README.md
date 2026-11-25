@@ -57,11 +57,20 @@ For a multi-action task, Claude calls `TaskPlan` with `cubes` and stops. Each cu
 
 VS Code draws no band above the prompt, so there the task's progress rides on the spinner line (`Working… · Fix login · 3/7 · ~2m left`).
 
-## Agent animation
+## Animation
 
-- The band shows one row per running agent: its cube, time left and last tool, with a done line when they finish.
-- The Agents pane shows big animated art. It opens on its own when agents start (in terminals at least 144 columns wide) and closes 3 s after they finish.
-- `/tp-agents` opens or closes the pane.
+`/tp-motion extreme | calm | off` sets how much moves; the choice is kept across sessions. Extreme is the default.
+
+- **Extreme**:
+  - **Band:** the title decodes in from noise, then shimmers, beside a live equalizer, and the step count rolls. Embers drift off the head of the bar, and a finished step throws a burst of sparks. The bar flows through an aurora with a white-hot head. Each agent row has a spinner, a shimmering name, its cube, a budget meter that turns amber as time runs low and blinks red past it, a countdown, and its current tool decoding in. A finished task gets fireworks over the bar, a rainbow bar and title, and falling confetti.
+  - **Cubes pane:** status glyphs spin (running, in review), breathe (waiting for you) or orbit (approved). A status change lights the row up, a finished cube pops, and a failed one shakes. The progress bar eases between counts, Approve all shimmers, and the finished plan gets fireworks.
+  - **Agents pane:** a two-layer parallax starfield with shooting stars, each agent's scene with a budget meter under it, and a finale of fireworks, the mascot's jump and confetti.
+- **Calm**: the original motion (the walker on the bar, the mascot scenes) and spinning status glyphs.
+- **Off**: nothing moves. The frame clock slows to once a second, so countdowns still update.
+
+Claude Code tells plugins nothing about a system "reduce motion" setting in the terminal or the editor, so use `/tp-motion calm` or `off` if motion bothers you. In VS Code, the spinner line spins with a mini bar, the pane's progress bars ease between counts, and effect rows use the editor's monospace font so they stay in place.
+
+- The Agents pane opens on its own when agents start (in terminals at least 144 columns wide) and closes 3 s after they finish. `/tp-agents` opens or closes it.
 
 ## Context map when a plan finishes
 

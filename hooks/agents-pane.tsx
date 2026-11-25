@@ -2,7 +2,10 @@
 // The frame comes from the pure paneFrame; this file holds the engine-facing parts
 // (render, open/close, auto-open rules). Copies the patterns of cubes-pane.tsx.
 import type { ExecutorRun, Snapshot } from '../types/index'
-import { paneFrame, type AnimAgent } from './anim-frames'
+import { paneFrame, SLOT_W, type AnimAgent, type Line } from './anim-frames'
+import { clip } from './band-fx'
+import { confettiRain, fireworks, meter, rainbowText, starfieldPlus, type Motion } from './fx'
+import { readMotion } from './motion'
 
 export const AGENTS_PANE_ID = 'tp-agents'
 export const AGENTS_PANE_TITLE = 'Agents'
@@ -24,16 +27,46 @@ export function toAnimAgents(runs: ExecutorRun[], snap: Snapshot | null | undefi
   })
 }
 
+/**
+ * The pane in extreme motion: two layers of parallax stars with shooting stars, each agent's scene
+ * with a budget meter under it, and a finale of fireworks, the mascot's jump and falling confetti.
+ */
+export function extremePaneFrame(tick: number, agents: AnimAgent[], now: number, width: number, doneAt: number | null): Line[] {
+  if (agents.length === 0) {
+    if (doneAt == null || now < doneAt) return []
+    const art = paneFrame(tick, [], now, width, doneAt)
+    if (art.length === 0) return []
+    const title = rainbowText('✦ All done! ✦', tick)
+    const pad = Math.max(0, Math.floor((width - 13) / 2))
+    return [...fireworks(width, 3, now - doneAt, 7), ...art.slice(0, -1), clip([{ text: ' '.repeat(pad) }, ...title], width), ...confettiRain(width, 2, tick, 0.18)]
+  }
+  const blocks = paneFrame(tick, agents, now, width).slice(1) // 3 lines per agent, without the plain starfield
+  const out: Line[] = [starfieldPlus(width, tick, 0), starfieldPlus(width, tick, 1)]
+  agents.forEach((a, i) => {
+    out.push(...blocks.slice(i * 3, i * 3 + 3))
+    if (a.budgetMs && a.budgetMs > 0) {
+      const used = (now - a.startedAt) / a.budgetMs
+      const cells = Math.max(4, Math.min(20, width - SLOT_W - 6))
+      out.push(clip([{ text: ' '.repeat(SLOT_W) }, ...meter(used, cells, tick), { text: ` ${Math.min(999, Math.round(used * 100))}%`, dim: true }], width))
+    }
+  })
+  return out
+}
+
 /** Draws the Pane. Reading frame/runs/animDoneAt subscribes, so each ticker frame and each run change redraws it. */
 export async function renderAgentsPane($: any, e: any, doneMs: number) {
   const { Box, Text } = $.ui.resolve(e)
-  const { value: frame = 0 } = await $.state.get({ plugin: 'task-progress', key: 'frame' })
+  const motion: Motion = await readMotion($)
+  // With motion off the pane never reads the frame, so the ticker never redraws it.
+  const frame: number = motion === 'off' ? 0 : ((await $.state.get({ plugin: 'task-progress', key: 'frame' })).value ?? 0)
   const { value: runs = [] } = await $.state.get({ plugin: 'task-progress', key: 'runs' })
   const { value: doneAt = 0 } = await $.state.get({ plugin: 'task-progress', key: 'animDoneAt' })
   const { value: snap } = await $.state.get({ plugin: 'task-progress', key: 'snapshot' })
   const now: number = await $.clock.now()
   const width = Math.max(20, Number(e?.props?.bodyColumns) || AGENTS_PANE_COLUMNS)
-  const lines = paneFrame(frame, toAnimAgents(runs, snap), now, width, doneAt && now - doneAt < doneMs ? doneAt : null)
+  const agents = toAnimAgents(runs, snap)
+  const finishedAt = doneAt && now - doneAt < doneMs ? doneAt : null
+  const lines = motion === 'extreme' ? extremePaneFrame(frame, agents, now, width, finishedAt) : paneFrame(frame, agents, now, width, finishedAt)
   return (
     <Box flexDirection="column">
       {lines.length === 0 ? <Text dimColor>No agents running</Text> : null}

@@ -18,6 +18,9 @@ function setup($: any, on: any) {
     const { Text } = $.ui.resolve(e)
     return <Text>ENGINE</Text>
   })
+  // These tests check the calm renderer; extreme motion has its own tests.
+  on('store.get', (_: any, e: any) => ({ value: e.key === 'motion' ? 'calm' : undefined }))
+  on('store.set', () => ({ value: undefined }))
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   on('tool.register', () => ({ value: { tool: 'x' } }))
   on('command.register', () => ({ value: { command: 'x' } }))

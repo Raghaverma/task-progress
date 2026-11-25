@@ -23,6 +23,9 @@ function setup($: any, on: any) {
     const { Text } = $.ui.resolve(e)
     return <Text>ENGINE</Text>
   })
+  // These tests check the calm renderer; extreme motion has its own tests.
+  on('store.get', (_: any, e: any) => ({ value: e.key === 'motion' ? 'calm' : undefined }))
+  on('store.set', () => ({ value: undefined }))
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   on('tool.register', () => ({ value: { tool: 'x' } }))
   on('command.register', () => ({ value: { command: 'x' } }))
@@ -576,6 +579,9 @@ test('the editor, which draws no band, carries progress on the spinner line; the
   on('tool.register', () => ({ value: { tool: 'x' } }))
   on('command.register', () => ({ value: { command: 'x' } }))
   on('tool.call', () => ({ result: {} }))
+  let stored = 'off'
+  on('store.get', (_: any, e: any) => ({ value: e.key === 'motion' ? stored : undefined }))
+  on('store.set', () => ({ value: undefined }))
   await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
   const spinner = async (surface: string) => {
     const ui = await $.ui.mount({ plugin: 'task-progress', component: 'Spinner', requestId: 'spin', surface, props: { word: 'Baking', message: null, suffix: '…', mode: 'tool-use' } } as any)
@@ -587,6 +593,67 @@ test('the editor, which draws no band, carries progress on the spinner line; the
   await $.tool.call({ tool: PROGRESS, task: 'Fix login', totalSteps: 4, step: 1 })
   expect(await spinner('vscode')).toBe('Baking… · Fix login · 1/4')
   expect(await spinner('terminal')).toBe('Baking…')
+  // With motion on, a braille spinner turns and the mini bar's next cell blinks.
+  await $.command.run({ command: 'tp-motion', args: 'extreme' })
+  const moving = await spinner('vscode')
+  expect(moving).toMatch(/^Baking… · [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Fix login ▰▰▰?▱+ 1\/4$/)
   await $.tool.call({ tool: PROGRESS, task: 'Fix login', totalSteps: 4, step: 4, done: true })
   expect(await spinner('vscode')).toBe('Baking…')
+  void stored
+})
+
+test('extreme is the default: the band gets an equalizer, an ember row and a flowing bar; /tp-motion changes it and keeps it', async ($, on) => {
+  const clock = mock.clock(on, { now: 5_000_000 })
+  on('ui.render', ($: any, e: any) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>ENGINE</Text>
+  })
+  const stored: Record<string, unknown> = {}
+  on('store.get', (_: any, e: any) => ({ value: stored[e.key] }))
+  on('store.set', (_: any, e: any) => {
+    stored[e.key] = e.value
+    return { value: undefined }
+  })
+  on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
+  on('tool.register', () => ({ value: { tool: 'x' } }))
+  on('command.register', () => ({ value: { command: 'x' } }))
+  on('tool.call', () => ({ result: {} }))
+  let ticks = 0
+  on('state.set', (_: any, e: any, next: any) => {
+    if (e.key === 'frame') ticks += 1
+    return next(e)
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const band = async () => {
+    const ui = await $.ui.mount({ plugin: 'task-progress', component: 'AbovePrompt', requestId: 'band', surface: 'terminal', props: { hasSurvey: false, bodyColumns: 100 } } as any)
+    const t = (await ui.findAll({ type: 'Text' })).map((x: any) => ({ text: x.text, color: x.props.color }))
+    await ui.unmount()
+    return t
+  }
+  expect(String((await $.command.run({ command: 'tp-motion' })).text)).toContain('Animation: extreme')
+  await $.tool.call({ tool: PROGRESS, task: 'Ship it', totalSteps: 4, step: 0 })
+  // A minute-long first step: the estimate (~3m) and the mood hold still while the test runs.
+  await clock.advance(60_000)
+  await $.tool.call({ tool: PROGRESS, task: 'Ship it', totalSteps: 4, step: 1 })
+  await clock.advance(900) // let the fill ease in
+  const a = await band()
+  const joined = a.map(x => x.text).join('')
+  expect(joined).toMatch(/^[▁▂▃▄▅▆▇]{5} /) // the equalizer leads the title row
+  expect(joined).toContain('━')
+  expect(new Set(a.filter(x => x.text === '━').map(x => x.color)).size).toBeGreaterThan(3) // a gradient, cell by cell
+  await clock.advance(600)
+  expect((await band()).map(x => x.text).join('')).not.toBe(joined) // it moves
+
+  expect(String((await $.command.run({ command: 'tp-motion', args: 'loud' })).text)).toContain('Usage')
+  expect(String((await $.command.run({ command: 'tp-motion', args: 'off' })).text)).toContain('Animation: off')
+  expect(stored.motion).toBe('off')
+  const before = ticks
+  await clock.advance(3000)
+  expect(ticks - before).toBeLessThanOrEqual(4) // one frame a second, for the countdowns
+  const s1 = (await band()).map(x => x.text).join('')
+  await clock.advance(2000)
+  expect((await band()).map(x => x.text).join('')).toBe(s1) // nothing moves
+
+  expect(String((await $.command.run({ command: 'tp-motion', args: 'calm' })).text)).toContain('Animation: calm')
+  expect((await band()).map(x => x.text).join('')).toContain('Ship it')
 })

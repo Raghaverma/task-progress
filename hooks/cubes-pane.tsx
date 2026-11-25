@@ -1,7 +1,10 @@
 // The Cubes pane: the plan as a short list you act on. The model (buildPaneModel) is pure;
 // renderCubesPane draws it for the terminal and for the editor/desktop surfaces.
-import type { Cube, CubeBoard, ReviewFinding, Snapshot, SnapshotAgent } from '../types/index'
+import type { Cube, CubeBoard, CubeStatus, ReviewFinding, Snapshot, SnapshotAgent } from '../types/index'
 import { actionsFor, isBlocking, runPaneAction, type CubeAction, type InputKind } from './cubes-pane-actions'
+import { AURORA, along, easeOut, fireworks, flash, mix, parseMotion, pulse, rainbow, rainbowText, shimmer, spin, type Motion } from './fx'
+import type { Line } from './anim-frames'
+import { readMotion } from './motion'
 import { buildAgentRows, trunc } from './pane-agents'
 import { buildUsageRows } from './pane-usage'
 
@@ -27,6 +30,7 @@ export type DetailSection = { title: string; items: { text: string; tone?: Tone;
 
 export type PaneRow = {
   id: string
+  status: CubeStatus
   title: string
   glyph: string
   tone?: Tone
@@ -115,7 +119,7 @@ function rowOf(c: Cube, board: CubeBoard, section: SectionKey, agents: SnapshotA
   const reviewer = agents.find(a => a.status === 'running' && a.cube?.kind === 'review' && a.cube.id === c.id)
   const summary = oneLine(c.summary || c.details || '')
   const lastAnswer = c.thread?.length ? c.thread[c.thread.length - 1] : undefined
-  let r: Omit<PaneRow, 'id' | 'title' | 'actions' | 'showActions' | 'open' | 'details'> & { subIsSummary?: boolean }
+  let r: Omit<PaneRow, 'id' | 'status' | 'title' | 'actions' | 'showActions' | 'open' | 'details'> & { subIsSummary?: boolean }
   switch (c.status) {
     case 'proposed':
       r = rejectedDep
@@ -173,6 +177,7 @@ function rowOf(c: Cube, board: CubeBoard, section: SectionKey, agents: SnapshotA
   const { subIsSummary, ...rest } = r
   return {
     id: c.id,
+    status: c.status,
     title: c.title,
     ...rest,
     actions: actionsFor(c),
@@ -227,6 +232,69 @@ export function buildPaneModel(
   }
 }
 
+/** What a row's glyph and title look like at this tick: spinning, breathing, popping or shaking by status. */
+export type GlyphFx = { glyph: string; color?: string; titleColor?: string; bold?: boolean }
+
+/** `sinceChange` is the time since this cube's status last changed (Infinity when it has not, this session). */
+export function glyphFx(r: Pick<PaneRow, 'glyph' | 'tone' | 'status' | 'id'>, motion: Motion, tick: number, sinceChange: number): GlyphFx {
+  const base: GlyphFx = { glyph: r.glyph, color: r.tone ? TONES[r.tone] : undefined }
+  if (motion === 'off') return base
+  const seed = r.id.length * 3 + r.id.charCodeAt(r.id.length - 1)
+  if (r.status === 'running') base.glyph = spin('moon', tick, seed, 2)
+  if (r.status === 'reviewing') base.glyph = spin('quarter', tick, seed, 2)
+  if (motion === 'calm') return base
+  // A status change lights the title up, fading back over 1.2 s.
+  if (sinceChange < 1200) base.titleColor = flash(base.color ?? '#9CA3AF', '#FFFFFF', sinceChange, 1200)
+  switch (r.status) {
+    case 'proposed':
+      return { ...base, glyph: spin('breathe', tick, seed, 2), color: pulse(TONES.needs, '#FDE68A', tick + seed, 14), bold: true }
+    case 'approved':
+      return { ...base, glyph: spin('orbit', tick, seed, 2) }
+    case 'queued':
+      return { ...base, color: pulse('#6B7280', '#A5B4FC', tick + seed, 20) }
+    case 'revising':
+      return { ...base, glyph: spin('arc', tick, seed, 2), color: '#A5B4FC' }
+    case 'running':
+      return { ...base, color: pulse(TONES.running, '#93C5FD', tick, 10), bold: true }
+    case 'reviewing':
+      return { ...base, color: pulse(TONES.review, '#C4B5FD', tick, 10), bold: true }
+    case 'failed':
+      // A shake (the glyph jumps a column) and a red-white flash when it fails, then a slow red throb.
+      if (sinceChange < 1500) return { ...base, glyph: Math.floor(tick) % 2 === 0 ? '✗' : '×', color: flash(TONES.fail, '#FFFFFF', sinceChange % 300, 300), bold: true }
+      return { ...base, color: pulse(TONES.fail, '#F87171', tick, 16) }
+    case 'done':
+      // A pop: a burst of stars that settles into the check, flashing white to green.
+      if (sinceChange < 1600) return { ...base, glyph: ['✺', '✦', '✧', '✦', '✓'][Math.min(4, Math.floor(sinceChange / 320))]!, color: flash(TONES.done, '#FFFFFF', sinceChange, 1600), titleColor: flash('#16A34A', '#FFFFFF', sinceChange, 1600), bold: true }
+      return base
+    default:
+      return base
+  }
+}
+
+// When each cube's status last changed, as this pane saw it (status flashes and pops read it). Bounded.
+const seen = new Map<string, { status: string; at: number }>()
+function changedAt(key: string, status: string, now: number): number {
+  const rec = seen.get(key)
+  if (!rec) {
+    if (seen.size > 500) seen.clear()
+    seen.set(key, { status, at: -Infinity }) // first sight: no flash for what was already there
+    return -Infinity
+  }
+  if (rec.status !== status) seen.set(key, { status, at: now })
+  return seen.get(key)!.at
+}
+
+// The header bar eases from the old count to the new one when a cube finishes.
+let barMemo = { task: '', from: 0, to: 0, at: 0 }
+function shownDone(task: string, done: number, now: number): number {
+  if (barMemo.task !== task) barMemo = { task, from: done, to: done, at: now }
+  if (barMemo.to !== done) {
+    const cur = barMemo.from + (barMemo.to - barMemo.from) * easeOut((now - barMemo.at) / 700)
+    barMemo = { task, from: cur, to: done, at: now }
+  }
+  return barMemo.from + (barMemo.to - barMemo.from) * easeOut((now - barMemo.at) / 700)
+}
+
 const ACTION_LABEL: Record<CubeAction, string> = {
   approve: 'Approve',
   reject: 'Reject',
@@ -254,16 +322,34 @@ export async function renderCubesPane($: any, e: any, _doneMs = 3000) {
   const { value: openValue } = await $.state.get({ plugin: 'task-progress', key: 'cubesPaneOpen' })
   const { value: input } = await $.state.get({ plugin: 'task-progress', key: 'cubesPaneInput' })
   await $.state.get({ plugin: 'task-progress', key: 'paneTick' }) // subscribe: the agent poll ticks it, so countdowns move
+  const motion: Motion = await readMotion($)
+  // Reading the frame subscribes the pane to the ticker; with motion off it redraws only when something changes.
+  const tick: number = motion === 'off' ? 0 : ((await $.state.get({ plugin: 'task-progress', key: 'frame' })).value ?? 0)
+  const xt = motion === 'extreme'
   const openIds: string[] = Array.isArray(openValue) ? openValue : []
   const now: number = await $.clock.now()
   const m = buildPaneModel(snap?.cubes, snap?.agents ?? [], now, openIds, input ?? null)
   const act = (a: Parameters<typeof runPaneAction>[1]) => () => void runPaneAction($, a)
   const color = (t?: Tone) => (t ? TONES[t] : undefined)
+  // Effect rows are placed cell by cell: monospace keeps them in place in the editor (the terminal always is).
+  const spans = (l: Line, key: string) => (
+    <Text key={key} mono>
+      {l.map((x, i) => (
+        <Text key={String(i)} color={x.color} bold={x.bold} dimColor={x.dim}>
+          {x.text}
+        </Text>
+      ))}
+    </Text>
+  )
+  // Track every cube's status (hidden ones too), so a change flashes the moment it shows.
+  const task = snap?.cubes?.task ?? ''
+  const since = new Map<string, number>()
+  for (const cb of snap?.cubes?.cubes ?? []) since.set(cb.id, now - changedAt(`${task}|${cb.id}`, cb.status, now))
 
   if (m.kind === 'empty') {
     return (
       <Box flexDirection="column">
-        <Text bold>No plan yet</Text>
+        <Text bold>{motion === 'off' ? 'No plan yet' : `${spin('orbit', tick, 0, 3)} No plan yet`}</Text>
         <Text dimColor wrap="wrap">When Claude plans a task in cubes, they show up here for you to approve.</Text>
         {usage()}
       </Box>
@@ -271,9 +357,20 @@ export async function renderCubesPane($: any, e: any, _doneMs = 3000) {
   }
 
   function bar(done: number, total: number) {
-    if (!isTerm) return <Progress key="progress" label="Cubes done" value={done} max={Math.max(1, total)} valueText={`${done} of ${total} done`} color={TONES.done} />
+    // The fill eases to a new count instead of jumping.
+    const shown = motion === 'off' ? done : shownDone(m.kind === 'board' ? m.task : '', done, now)
+    if (!isTerm) return <Progress key="progress" label="Cubes done" value={shown} max={Math.max(1, total)} valueText={`${done} of ${total} done`} color={TONES.done} />
     const cells = Math.max(10, width - 2)
-    const lit = total > 0 ? Math.round((done / total) * cells) : 0
+    const lit = total > 0 ? Math.round((shown / total) * cells) : 0
+    if (xt) {
+      const allDone = total > 0 && done >= total
+      const line: Line = Array.from({ length: cells }, (_, i) =>
+        i < lit || allDone
+          ? { text: '━', color: allDone ? rainbow(i, tick * 2) : i === lit - 1 ? pulse('#FFFFFF', '#7DD3FC', tick, 6) : along(AURORA, i * 0.12 - tick * 0.25) }
+          : { text: '━', color: (i - Math.floor(tick * 0.8)) % 29 === 0 ? '#6B7280' : '#4B5160' },
+      )
+      return spans(line, 'bar')
+    }
     return (
       <Text>
         <Text color={TONES.done}>{'━'.repeat(lit)}</Text>
@@ -310,17 +407,20 @@ export async function renderCubesPane($: any, e: any, _doneMs = 3000) {
   function row(r: PaneRow) {
     const meta = r.meta ?? ''
     const room = Math.max(8, width - 2 - r.id.length - 2 - (meta ? meta.length + 1 : 0))
+    const g = glyphFx(r, motion, tick, since.get(r.id) ?? Infinity)
+    // A countdown running low throbs; one past its budget blinks.
+    const metaColor = xt && r.status === 'running' && r.metaTone ? (r.metaTone === 'fail' ? (Math.floor(tick / 3) % 2 === 0 ? TONES.fail : '#7F1D1D') : pulse(TONES.needs, '#FDE68A', tick, 6)) : color(r.metaTone)
     return (
       <Box key={`cube-${r.id}`} flexDirection="column" marginBottom={r.open ? 1 : 0}>
         <Box justifyContent="space-between">
           <Button key={`row-${r.id}`} plain onPress={act({ kind: 'toggleDetails', id: r.id })}>
-            <Text color={color(r.tone)} dimColor={r.dim && !r.tone}>{r.glyph}</Text>
+            <Text color={g.color} bold={g.bold} dimColor={r.dim && !g.color}>{g.glyph}</Text>
             {' '}
             <Text dimColor>{r.id}</Text>
             {'  '}
-            <Text dimColor={r.dim} bold={r.open}>{trunc(r.title, room)}</Text>
+            <Text color={g.titleColor} dimColor={r.dim && !g.titleColor} bold={r.open}>{trunc(r.title, room)}</Text>
           </Button>
-          {meta ? <Text color={color(r.metaTone)} dimColor={!r.metaTone}>{meta}</Text> : null}
+          {meta ? <Text color={metaColor} dimColor={!metaColor}>{meta}</Text> : null}
         </Box>
         {r.sub ? (
           <Box marginLeft={2}>
@@ -376,18 +476,41 @@ export async function renderCubesPane($: any, e: any, _doneMs = 3000) {
     )
   }
 
+  // Everything done a moment ago: fireworks over the header for six seconds.
+  const lastEnd = Math.max(0, ...(snap?.cubes?.cubes ?? []).map(cb => cb.endedAt ?? 0))
+  const party = xt && m.total > 0 && m.done >= m.total && lastEnd > 0 && now - lastEnd >= 0 && now - lastEnd < 6000
+  const doneSince = now - changedAt(`${task}|_doneCount`, String(m.done), now)
+
+  function sectionTitle(sec: PaneSection) {
+    const text = `${sec.title} · ${sec.count}`
+    if (xt && sec.key === 'needs') return <Text bold color={pulse(TONES.needs, '#FDE68A', tick, 14)}>{text}</Text>
+    // The Done header pops when a cube lands in it.
+    if (xt && sec.key === 'done' && doneSince < 1600) {
+      return <Text bold color={flash(TONES.done, '#FFFFFF', doneSince, 1600)}>{`${['✺', '✦', '✧', '✓'][Math.min(3, Math.floor(doneSince / 400))]} ${text}`}</Text>
+    }
+    return <Text bold dimColor>{text}</Text>
+  }
+
   return (
     <Box flexDirection="column">
-      <Text bold wrap="truncate-end">{m.task}</Text>
+      {party ? fireworks(width, 3, now - lastEnd, task.length).map((l, i) => spans(l, `fw${i}`)) : null}
+      {party ? spans(rainbowText('✦ All done ✦', tick), 'party') : null}
+      {xt ? spans(shimmer(m.task, tick, '#3B82F6', '#93C5FD', 30).map(x => ({ ...x, bold: true })), 'title') : <Text bold wrap="truncate-end">{m.task}</Text>}
       {bar(m.done, m.total)}
       <Text dimColor>{m.counts}</Text>
       {m.sections.map(sec => (
         <Box key={`sec-${sec.key}`} flexDirection="column" marginTop={1}>
           <Box justifyContent="space-between">
-            <Text bold dimColor>{`${sec.title} · ${sec.count}`}</Text>
+            {sectionTitle(sec)}
             {sec.key === 'needs' && m.approveAll > 1 ? (
               <Button key="approve-all" variant="primary" hotkey="a" onPress={act({ kind: 'approveAll' })}>
-                {`Approve all (${m.approveAll})`}
+                {xt
+                  ? shimmer(`Approve all (${m.approveAll})`, tick, '#FFFFFF', '#FDE68A', 18).map((x, i) => (
+                      <Text key={String(i)} color={x.color}>
+                        {x.text}
+                      </Text>
+                    ))
+                  : `Approve all (${m.approveAll})`}
               </Button>
             ) : sec.key === 'done' ? (
               <Button key="toggle-done" plain dimColor onPress={act({ kind: 'toggleDetails', id: '_done' })}>
@@ -405,7 +528,7 @@ export async function renderCubesPane($: any, e: any, _doneMs = 3000) {
             <Box key={`agent-${a.id}`} flexDirection="column">
               <Box justifyContent="space-between">
                 <Text>
-                  <Text color={TONES.running}>◐</Text> {a.name}
+                  <Text color={TONES.running}>{motion === 'off' ? '◐' : spin('moon', tick, a.id.length, 2)}</Text> {a.name}
                   {a.tag ? <Text dimColor>{` · ${a.tag}`}</Text> : null}
                 </Text>
                 {a.time ? <Text color={a.over ? TONES.fail : undefined} dimColor={!a.over}>{a.time.replace(' left', '').replace(' over', '')}</Text> : null}

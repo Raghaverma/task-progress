@@ -23,7 +23,10 @@ import { installedNames, missingDeps } from './deps-check'
 import { AGENTS_PANE_ID, autoCloseAgentsPane, autoOpenAgentsPane, clearAgentsPaneHold, onAgentsPaneClose, openAgentsPaneForPlan, releaseAgentsPaneHold, renderAgentsPane, toggleAgentsPane } from './agents-pane'
 import { PANE_ID, hasUnfinished, onCubesPaneClose, openCubesPane, renderCubesPane } from './cubes-pane'
 import { buildBoard, checkDescribed, gateCheck, normalizeCube, topoOrder } from './cubes-model'
-import { FAIL_MS, creatureFor, doneLine, glyph, trail, walker, type Line, type Mood } from './anim-frames'
+import { FAIL_MS, creatureFor, doneLine, glyph, toolSinceOf, trail, walker, type Line, type Mood } from './anim-frames'
+import { agentRow as bandAgentRow, auroraBar, doneRows, skyRows, titleRow, type BandInput } from './band-fx'
+import { readMotion } from './motion'
+import { parseMotion, spin, type Motion } from './fx'
 import type { ExecutorRun, PendingRun, SnapshotAgent, TaskPlanRecord, TaskProgressRecord } from '../types/index'
 
 const PLUGIN = 'task-progress'
@@ -280,13 +283,28 @@ export function formatMeta(p: TaskProgressRecord, now: number): string {
   return parts.join(' · ')
 }
 
+/** `~2m left`, or '' before there is anything to estimate from (a first report at step 1 would read "~1s left"). */
+function spinnerEta(p: TaskProgressRecord, now: number): string {
+  if (p.step > 0 && p.step < p.totalSteps && now - p.startedAt >= 5000) return `${formatEta(((now - p.startedAt) / p.step) * (p.totalSteps - p.step))} left`
+  return ''
+}
+
 /** The spinner-line text where no band is drawn (the editor): `Fix login bug · 3/7 · ~2m left`; null when nothing runs. */
 export function spinnerProgress(p: TaskProgressRecord | null | undefined, now: number): string | null {
   if (!p || p.isDone) return null
-  const parts = [p.task, `${p.step}/${p.totalSteps}`]
-  // No estimate until some time has passed: a first report at step 1 would read "~1s left".
-  if (p.step > 0 && p.step < p.totalSteps && now - p.startedAt >= 5000) parts.push(`${formatEta(((now - p.startedAt) / p.step) * (p.totalSteps - p.step))} left`)
-  return parts.join(' · ')
+  const eta = spinnerEta(p, now)
+  return [p.task, `${p.step}/${p.totalSteps}`, ...(eta ? [eta] : [])].join(' · ')
+}
+
+/** The same with motion: a spinning braille glyph and a mini bar whose next cell blinks, `⠹ Fix login ▰▰▰▰▱▱▱▱ 2/4 · ~1m left`. */
+export function spinnerProgressAnimated(p: TaskProgressRecord | null | undefined, now: number, tick: number): string | null {
+  if (!p || p.isDone) return null
+  const cells = 8
+  const lit = Math.round((p.step / Math.max(1, p.totalSteps)) * cells)
+  const blink = Math.floor(tick / 3) % 2 === 0
+  const bar = Array.from({ length: cells }, (_, i) => (i < lit || (i === lit && blink) ? '▰' : '▱')).join('')
+  const eta = spinnerEta(p, now)
+  return `${spin('braille', tick)} ${p.task} ${bar} ${p.step}/${p.totalSteps}${eta ? ` · ${eta}` : ''}`
 }
 
 /** `Fix login bug — step 3 of 7 (43%) · running tests · 4m 10s elapsed · ~2m left` */
@@ -343,6 +361,17 @@ export function overlayWalker(cells: Cell[], pos: number, totalSteps: number, fr
     out[tStart + i] = { ch: s.text, color: s.dim ? C_DIM_TRAIL : (s.color ?? C_TO) }
   })
   for (let i = 0; i < room; i++) out[start + i] = wcells[i]!
+  return out
+}
+
+/** Bar cells as spans: neighbours of one colour share a span. */
+export function cellsLine(cells: Cell[]): Line {
+  const out: Line = []
+  for (const c of cells) {
+    const last = out.at(-1)
+    if (last && (last.color ?? '') === c.color) last.text += c.ch
+    else out.push(c.color ? { text: c.ch, color: c.color } : { text: c.ch })
+  }
   return out
 }
 
@@ -426,11 +455,13 @@ type Ctx = {
   composeSeen: boolean
   /** True once the rules were attached to a user prompt as a fallback. */
   rulesSent: boolean
+  /** The frame period: TICK_MS while things move, once a second with motion off (countdowns only). */
+  tickMs: number
 }
 
 function startTicker($: any, c: Ctx) {
   if (c.ticker) return
-  c.ticker = $.clock.every(TICK_MS, () => {
+  c.ticker = $.clock.every(c.tickMs, () => {
     c.frame += 1
     void $.state.set(frameRef, c.frame)
   })
@@ -455,6 +486,23 @@ async function releaseTicker($: any, c: Ctx) {
   // A fail shake needs the clock for FAIL_MS (+ one tick) even when no run is left.
   const shaking = !!failAt && now - failAt < FAIL_MS + TICK_MS
   if (!shows && !(runs && runs.length > 0) && !animating && !shaking) stopTicker(c)
+}
+
+// State keys are literal consts of the file that uses them (the engine lists what a module reads and writes).
+const motionRef = { plugin: 'task-progress', key: 'motion' } as const
+/** Sets the motion level, keeps it for later sessions and retimes a running frame clock. */
+async function setMotion($: any, c: Ctx, m: Motion) {
+  await $.state.set(motionRef, m)
+  try {
+    await $.store.set('motion', m)
+  } catch {
+    // no store here: the choice lasts this session
+  }
+  c.tickMs = m === 'off' ? 1000 : TICK_MS
+  if (c.ticker) {
+    stopTicker(c)
+    startTicker($, c)
+  }
 }
 
 /** Orchestrator mode is opt-in: unset means off. */
@@ -597,7 +645,7 @@ async function orchestrateCommand($: any, e: any) {
 }
 
 export const register: Register = on => {
-  const c: Ctx = { clearTimer: undefined, ticker: undefined, frame: 0, doneIds: [], composeSeen: false, rulesSent: false }
+  const c: Ctx = { clearTimer: undefined, ticker: undefined, frame: 0, doneIds: [], composeSeen: false, rulesSent: false, tickMs: TICK_MS }
   // The dashboard poll stamps a failed agent; keep the clock running for its shake, then redraw once to the failed row.
   on('state.set', ($, e, next) => {
     if (e.plugin === 'task-progress' && e.key === 'animFailAt' && e.value) {
@@ -757,6 +805,11 @@ export const register: Register = on => {
       },
     })
     try {
+      await $.command.register({ name: 'tp-motion', description: 'Animation level: /tp-motion extreme | calm | off' })
+    } catch {
+      // best effort
+    }
+    try {
       await $.command.register({ name: 'tp-agents', description: 'Toggle the animated Agents pane' })
     } catch {
       // best effort
@@ -802,6 +855,15 @@ export const register: Register = on => {
     c.crew = []
     await $.state.set(pendingRef, [])
     stopTicker(c)
+    let stored: unknown
+    try {
+      stored = await $.store.get('motion')
+    } catch {
+      // no store: the default
+    }
+    const motion = parseMotion(stored) ?? parseMotion((await $.state.get(motionRef)).value) ?? 'extreme'
+    await $.state.set(motionRef, motion)
+    c.tickMs = motion === 'off' ? 1000 : TICK_MS
     if (value && !value.isDone) startTicker($, c)
     await quiet(onSessionStart($, e))
     // Safety net: once per session, say so when the plugins the work is routed to are not installed.
@@ -1117,6 +1179,14 @@ export const register: Register = on => {
     return next(e)
   })
   on('command.run', { command: 'tp-agents' }, async $ => ({ text: await toggleAgentsPane($) }))
+  on('command.run', { command: 'tp-motion' }, async ($, e) => {
+    const arg = String(e.args ?? '').trim()
+    if (arg === '' || arg === 'status') return { text: `Animation: ${await readMotion($)}. Choose extreme, calm or off.` }
+    const m = parseMotion(arg)
+    if (!m) return { text: 'Usage: /tp-motion extreme | calm | off' }
+    await setMotion($, c, m)
+    return { text: m === 'extreme' ? 'Animation: extreme. Everything moves.' : m === 'calm' ? 'Animation: calm. The original, lighter motion.' : 'Animation: off. Nothing moves; countdowns still update.' }
+  })
 
   on('command.run', { command: 'orchestrate' }, orchestrateCommand)
   on('command.run', { command: 'tp-orchestrate' }, orchestrateCommand)
@@ -1127,7 +1197,11 @@ export const register: Register = on => {
     if ((e as any).surface !== 'vscode') return next(e)
     const { value: progress } = await $.state.get(progressRef)
     const { value: isHidden } = await $.state.get(hiddenRef)
-    const text = isHidden ? null : spinnerProgress(progress, await $.clock.now())
+    const motion = await readMotion($)
+    const now = await $.clock.now()
+    let text = isHidden ? null : spinnerProgress(progress, now)
+    // Reading the frame subscribes the line to the ticker, so it spins; with motion off it stays still.
+    if (text && motion !== 'off') text = spinnerProgressAnimated(progress, now, (await $.state.get(frameRef)).value ?? 0)
     if (!text) return next(e)
     const props: any = (e as any).props ?? {}
     return next({ ...e, props: { ...props, suffix: `${props.suffix ?? '…'} · ${text}` } } as any)
@@ -1145,7 +1219,9 @@ export const register: Register = on => {
     if (!showsBar && runs.length === 0 && !doneNow) return next(e)
 
     const { Box, Text } = $.ui.resolve(e)
-    const { value: frame = 0 } = await $.state.get(frameRef)
+    const motion = await readMotion($)
+    // With motion off the band never reads the frame, so the ticker never redraws it.
+    const frame: number = motion === 'off' ? 0 : ((await $.state.get(frameRef)).value ?? 0)
     const now = await $.clock.now()
 
     const width: number = Math.max(20, Number((e as any).props?.bodyColumns) || 80)
@@ -1161,6 +1237,34 @@ export const register: Register = on => {
         ))}
       </Box>
     )
+
+    if (motion === 'extreme') {
+      const lines: Line[] = []
+      if (progress && showsBar) {
+        const n = segmentCount(progress.totalSteps)
+        const w = segmentWidth(n)
+        const pos = barPosition(progress, now, frame)
+        const waitingOnUser = runs.length === 0 && !!(snap as any)?.cubes?.cubes?.some?.((x: any) => x.status === 'proposed')
+        const mood = bandMood(progress, { waitingOnUser }, now)
+        const meta = formatMeta(progress, now)
+        const input: BandInput = { ...progress, eta: progress.isDone ? meta : meta.split(' · ').slice(1).join(' · '), mood }
+        lines.push(titleRow(input, now, frame, width), ...skyRows(input, n, w, pos, now, frame))
+        lines.push(cellsLine(overlayWalker(auroraBar(n, w, pos, frame, progress.isDone), pos, progress.totalSteps, frame, mood)))
+      }
+      if (isDoneShown) {
+        const { value: crew = [] } = await $.state.get(doneCrewRef)
+        lines.push(...doneRows(crew.length, frame, width))
+      } else {
+        runs.forEach((r, i) => {
+          const a = agentOf(r.id)
+          const tag = a?.cube ? (a.cube.kind === 'review' ? `review ${a.cube.id}` : a.cube.id) : runLabel(r, i)
+          const what = (a?.lastTool || a?.description || '').replace(/\s+/g, ' ').trim()
+          const row = { id: r.id, name: creatureFor(r.type, r.id).name, tag, startedAt: r.startedAt, budgetMs: r.budgetMs, what, whatSince: toolSinceOf(r.id, a?.lastTool, now, r.startedAt) }
+          lines.push(bandAgentRow(row, i, now, frame, width))
+        })
+      }
+      return <Box flexDirection="column">{lines.map((l, i) => asRow(l, `x${i}`))}</Box>
+    }
 
     let agentRow: any = null
     if (isDoneShown) {

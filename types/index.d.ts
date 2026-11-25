@@ -199,6 +199,8 @@ declare module 'claude-code' {
       frame: number
       /** Orchestrator mode; unset means off (opt-in). */
       mode: 'on' | 'off'
+      /** How much the band and panes animate (kept across sessions in $.store); unset means extreme. */
+      motion: 'extreme' | 'calm' | 'off'
       /** True once TaskInputs was answered for the current user prompt (informational; nothing is gated on it). */
       inputsChecked: boolean
       plan: TaskPlanRecord | null
